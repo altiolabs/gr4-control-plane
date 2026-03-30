@@ -20,7 +20,7 @@ bool operator==(const BlockParameterDescriptor& left, const BlockParameterDescri
 }
 
 bool operator==(const BlockDescriptor& left, const BlockDescriptor& right) {
-    return left.id == right.id && left.name == right.name && left.category == right.category &&
+    return left.id == right.id && left.canonical_type == right.canonical_type && left.name == right.name && left.category == right.category &&
            left.summary == right.summary && left.inputs == right.inputs && left.outputs == right.outputs &&
            left.parameters == right.parameters;
 }

@@ -6,6 +6,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
     return {
         {
             .id = "blocks.analog.wfm_rcv",
+            .canonical_type = std::nullopt,
             .name = "WFM Receive",
             .category = "Analog",
             .summary = "Demodulates a wideband FM complex input stream",
@@ -19,6 +20,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
         },
         {
             .id = "blocks.fft.fft_vcc",
+            .canonical_type = std::nullopt,
             .name = "FFT",
             .category = "FFT",
             .summary = "Computes a complex FFT over vector input frames",
@@ -32,6 +34,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
         },
         {
             .id = "blocks.filters.fir_filter_ccf",
+            .canonical_type = std::nullopt,
             .name = "FIR Filter",
             .category = "Filters",
             .summary = "Applies float taps to a complex input stream",
@@ -45,6 +48,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
         },
         {
             .id = "blocks.math.add_ff",
+            .canonical_type = std::nullopt,
             .name = "Add",
             .category = "Math",
             .summary = "Adds two float streams",
@@ -57,6 +61,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
         },
         {
             .id = "blocks.sinks.null_sink",
+            .canonical_type = std::nullopt,
             .name = "Null Sink",
             .category = "Sinks",
             .summary = "Consumes input samples and discards them",
@@ -69,6 +74,7 @@ std::vector<domain::BlockDescriptor> StaticBlockCatalogProvider::list() const {
         },
         {
             .id = "blocks.sources.signal_source_f",
+            .canonical_type = std::nullopt,
             .name = "Signal Source",
             .category = "Sources",
             .summary = "Generates a float waveform source",

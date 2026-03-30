@@ -702,6 +702,14 @@ struct CollectionMetadata {
     std::optional<std::string> element_type;
 };
 
+std::optional<std::string> reflected_canonical_type(const gr::BlockModel& block) {
+    const auto canonical = std::string(block.typeName());
+    if (canonical.empty()) {
+        return std::nullopt;
+    }
+    return canonical;
+}
+
 CollectionMetadata infer_collection_metadata(std::string_view collection_name,
                                              std::string_view block_id,
                                              bool is_input,
@@ -824,6 +832,7 @@ domain::BlockDescriptor reflect_block(const std::string& id) {
     auto parameters = to_parameters(*block);
     return {
         .id = id,
+        .canonical_type = reflected_canonical_type(*block),
         .name = block_name(*block, id),
         .category = block_category(*block, id),
         .summary = "",
@@ -908,13 +917,17 @@ nlohmann::json to_json(const domain::BlockDescriptor& block) {
         parameters.push_back(to_json(parameter));
     }
 
-    return nlohmann::json{{"id", block.id},
-                          {"name", block.name},
-                          {"category", block.category},
-                          {"summary", block.summary},
-                          {"inputs", std::move(inputs)},
-                          {"outputs", std::move(outputs)},
-                          {"parameters", std::move(parameters)}};
+    nlohmann::json value{{"id", block.id},
+                         {"name", block.name},
+                         {"category", block.category},
+                         {"summary", block.summary},
+                         {"inputs", std::move(inputs)},
+                         {"outputs", std::move(outputs)},
+                         {"parameters", std::move(parameters)}};
+    if (block.canonical_type.has_value()) {
+        value["canonical_type"] = *block.canonical_type;
+    }
+    return value;
 }
 
 domain::BlockParameterDefault parse_default_value(const nlohmann::json& value) {
@@ -1001,6 +1014,12 @@ domain::BlockDescriptor parse_block_descriptor(const std::string& payload) {
     const auto value = nlohmann::json::parse(payload);
     domain::BlockDescriptor block;
     block.id = value.at("id").get<std::string>();
+    if (const auto it = value.find("canonical_type"); it != value.end() && it->is_string()) {
+        const auto canonical_type = it->get<std::string>();
+        if (!canonical_type.empty()) {
+            block.canonical_type = canonical_type;
+        }
+    }
     block.name = value.at("name").get<std::string>();
     block.category = value.at("category").get<std::string>();
     block.summary = value.at("summary").get<std::string>();
