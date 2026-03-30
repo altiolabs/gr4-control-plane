@@ -1,6 +1,7 @@
 #include "gr4cp/app/block_catalog_service.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "gr4cp/app/session_service.hpp"
 
@@ -10,23 +11,32 @@ BlockCatalogService::BlockCatalogService(const catalog::BlockCatalogProvider& pr
 
 std::vector<domain::BlockDescriptor> BlockCatalogService::list() const {
     std::lock_guard lock(mutex_);
-    return cached_blocks();
+    return cached_catalog().browse_blocks;
 }
 
 domain::BlockDescriptor BlockCatalogService::get(const std::string& id) const {
     std::lock_guard lock(mutex_);
-    const auto& blocks = cached_blocks();
-    const auto it = std::find_if(blocks.begin(), blocks.end(), [&id](const domain::BlockDescriptor& block) {
-        return block.id == id;
-    });
-    if (it == blocks.end()) {
+    const auto& catalog = cached_catalog();
+    const auto it = catalog.exact_blocks.find(id);
+    if (it == catalog.exact_blocks.end()) {
         throw NotFoundError("block not found: " + id);
     }
-    return *it;
+    return it->second;
 }
 
-const std::vector<domain::BlockDescriptor>& BlockCatalogService::cached_blocks() const {
-    if (!cached_blocks_.has_value()) {
+namespace {
+
+std::string canonical_catalog_key(const domain::BlockDescriptor& block) {
+    if (block.canonical_type.has_value() && !block.canonical_type->empty()) {
+        return *block.canonical_type;
+    }
+    return block.id;
+}
+
+}  // namespace
+
+const BlockCatalogService::CachedCatalog& BlockCatalogService::cached_catalog() const {
+    if (!cached_catalog_.has_value()) {
         auto blocks = provider_.list();
         std::sort(blocks.begin(), blocks.end(), [](const domain::BlockDescriptor& left, const domain::BlockDescriptor& right) {
             if (left.category != right.category) {
@@ -37,9 +47,18 @@ const std::vector<domain::BlockDescriptor>& BlockCatalogService::cached_blocks()
             }
             return left.id < right.id;
         });
-        cached_blocks_ = std::move(blocks);
+        CachedCatalog catalog;
+        std::unordered_set<std::string> browse_keys;
+        for (const auto& block : blocks) {
+            catalog.exact_blocks.insert_or_assign(block.id, block);
+            const auto key = canonical_catalog_key(block);
+            if (browse_keys.insert(key).second) {
+                catalog.browse_blocks.push_back(block);
+            }
+        }
+        cached_catalog_ = std::move(catalog);
     }
-    return *cached_blocks_;
+    return *cached_catalog_;
 }
 
 }  // namespace gr4cp::app

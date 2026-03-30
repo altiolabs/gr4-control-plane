@@ -13,6 +13,17 @@ public:
         return {
             {
                 .id = "blocks.sources.signal_source_f",
+                .canonical_type = "gr::basic::SignalSource<float>",
+                .name = "Signal Source",
+                .category = "Sources",
+                .summary = "",
+                .inputs = {},
+                .outputs = {{"out", "float"}},
+                .parameters = {{"frequency", "float", false, 1000.0, ""}},
+            },
+            {
+                .id = "blocks.sources.signal_source_f_alias",
+                .canonical_type = "gr::basic::SignalSource<float>",
                 .name = "Signal Source",
                 .category = "Sources",
                 .summary = "",
@@ -22,6 +33,7 @@ public:
             },
             {
                 .id = "blocks.math.add_ff",
+                .canonical_type = std::nullopt,
                 .name = "Add",
                 .category = "Math",
                 .summary = "",
@@ -31,6 +43,7 @@ public:
             },
             {
                 .id = "blocks.analog.wfm_rcv",
+                .canonical_type = std::nullopt,
                 .name = "WFM Receive",
                 .category = "Analog",
                 .summary = "",
@@ -67,6 +80,19 @@ TEST_F(BlockCatalogServiceTest, GetReturnsBlockById) {
     EXPECT_EQ(block.inputs[0].name, "in0");
     ASSERT_EQ(block.parameters.size(), 1U);
     EXPECT_EQ(std::get<double>(block.parameters[0].default_value), 1.0);
+}
+
+TEST_F(BlockCatalogServiceTest, ListCollapsesAliasShapeDuplicatesButKeepsExactLookup) {
+    const auto blocks = service.list();
+
+    ASSERT_EQ(blocks.size(), 3U);
+    EXPECT_NE(std::find_if(blocks.begin(), blocks.end(), [](const auto& block) {
+                  return block.id == "blocks.sources.signal_source_f";
+              }),
+              blocks.end());
+    const auto alias_block = service.get("blocks.sources.signal_source_f_alias");
+    EXPECT_EQ(alias_block.id, "blocks.sources.signal_source_f_alias");
+    EXPECT_EQ(alias_block.name, "Signal Source");
 }
 
 TEST_F(BlockCatalogServiceTest, GetMissingBlockFails) {

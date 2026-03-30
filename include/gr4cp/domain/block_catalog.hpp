@@ -62,6 +62,7 @@ struct BlockParameterDescriptor {
 
 struct BlockDescriptor {
     std::string id;
+    std::optional<std::string> canonical_type;
     std::string name;
     std::string category;
     std::string summary;

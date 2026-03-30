@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include "gr4cp/catalog/block_catalog_provider.hpp"
@@ -17,11 +18,16 @@ public:
     domain::BlockDescriptor get(const std::string& id) const;
 
 private:
-    const std::vector<domain::BlockDescriptor>& cached_blocks() const;
+    struct CachedCatalog {
+        std::vector<domain::BlockDescriptor> browse_blocks;
+        std::unordered_map<std::string, domain::BlockDescriptor> exact_blocks;
+    };
+
+    const CachedCatalog& cached_catalog() const;
 
     const catalog::BlockCatalogProvider& provider_;
     mutable std::mutex mutex_;
-    mutable std::optional<std::vector<domain::BlockDescriptor>> cached_blocks_;
+    mutable std::optional<CachedCatalog> cached_catalog_;
 };
 
 }  // namespace gr4cp::app

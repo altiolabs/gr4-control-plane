@@ -26,6 +26,7 @@ public:
         return {
             {
                 .id = "gr::blocks::math::Add<float32, std::plus<float32>>",
+                .canonical_type = std::nullopt,
                 .name = "Add<float32>",
                 .category = "Math",
                 .summary = "Adds two float streams",
@@ -53,6 +54,7 @@ public:
             },
             {
                 .id = "blocks.math.add_dynamic",
+                .canonical_type = std::nullopt,
                 .name = "Add",
                 .category = "Math",
                 .summary = "Adds a dynamic number of float streams",
@@ -74,6 +76,7 @@ public:
             },
             {
                 .id = "blocks.sources.signal_source_f",
+                .canonical_type = std::nullopt,
                 .name = "Signal Source",
                 .category = "Sources",
                 .summary = "",
@@ -83,6 +86,7 @@ public:
             },
             {
                 .id = "blocks.math.add_ff",
+                .canonical_type = std::nullopt,
                 .name = "Add",
                 .category = "Math",
                 .summary = "Adds two float streams",
@@ -92,6 +96,7 @@ public:
             },
             {
                 .id = "blocks.analog.wfm_rcv",
+                .canonical_type = std::nullopt,
                 .name = "WFM Receive",
                 .category = "Analog",
                 .summary = "",
