@@ -1,9 +1,6 @@
 name: Docker CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
     inputs:
       gnuradio4_ref:
