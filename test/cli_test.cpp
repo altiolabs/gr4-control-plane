@@ -15,6 +15,7 @@
 #include "gr4cp/app/block_catalog_service.hpp"
 #include "gr4cp/app/block_settings_service.hpp"
 #include "gr4cp/app/session_service.hpp"
+#include "gr4cp/app/session_stream_service.hpp"
 #include "gr4cp/catalog/block_catalog_provider.hpp"
 #include "gr4cp/runtime/stub_runtime_manager.hpp"
 #include "gr4cp/storage/in_memory_session_repository.hpp"
@@ -44,10 +45,13 @@ protected:
     }
 
     void SetUp() override {
-        gr4cp::api::register_routes(server, service, block_catalog_service, block_settings_service);
-        port = server.bind_to_any_port("127.0.0.1");
+        server = std::make_unique<gr4cp::api::HttpServer>(service,
+                                                          session_stream_service,
+                                                          block_catalog_service,
+                                                          block_settings_service);
+        port = server->bind_to_any_port("127.0.0.1");
         ASSERT_GT(port, 0);
-        server_thread = std::jthread([this]() { server.listen_after_bind(); });
+        server_thread = std::jthread([this]() { server->listen_after_bind(); });
         wait_for_server_ready();
         url = "http://127.0.0.1:" + std::to_string(port);
         temp_dir = std::filesystem::temp_directory_path() / "gr4cp-cli-test";
@@ -55,8 +59,12 @@ protected:
     }
 
     void TearDown() override {
-        server.stop();
-        server_thread.join();
+        if (server) {
+            server->stop();
+        }
+        if (server_thread.joinable()) {
+            server_thread.join();
+        }
         std::error_code error;
         std::filesystem::remove_all(temp_dir, error);
     }
@@ -101,11 +109,12 @@ protected:
         return {1, output};
     }
 
-    httplib::Server server;
+    std::unique_ptr<gr4cp::api::HttpServer> server;
     gr4cp::storage::InMemorySessionRepository repository;
     gr4cp::runtime::StubRuntimeManager runtime_manager;
     EmptyBlockCatalogProvider block_catalog_provider;
     gr4cp::app::SessionService service{repository, runtime_manager};
+    gr4cp::app::SessionStreamService session_stream_service;
     gr4cp::app::BlockSettingsService block_settings_service{repository, runtime_manager};
     gr4cp::app::BlockCatalogService block_catalog_service{block_catalog_provider};
     int port{};

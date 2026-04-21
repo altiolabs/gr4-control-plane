@@ -137,6 +137,18 @@ Lifecycle semantics are owned by `SessionService`:
 
 If runtime operations fail during start, stop, restart, or remove, the service records the session as `Error`, stores `last_error`, updates `updated_at`, persists that state, and then throws an application-level runtime error.
 
+## Current Managed Stream Scope
+
+The current managed-stream integration is intentionally narrow and session-runtime-owned:
+
+- `GET /sessions` and `GET /sessions/{id}` may include optional `streams[]` only for running sessions
+- managed stream planning uses authored stream-export metadata on blocks, not block-family-specific planner rules
+- supported transport values are `http_snapshot`, `http_poll`, and `websocket`
+- authored stream-export metadata selects the managed runtime path and authored `endpoint` is ignored by control-plane runtime preparation
+- running-session `streams[]` plus the session-scoped browser routes are the active runtime contract
+- blocks without valid stream-export metadata remain on the legacy no-`streams[]` path
+- if authored stream-export metadata uses an invalid/unsupported managed transport, start/restart fails explicitly instead of silently falling back
+
 ## Runtime Seam
 
 The runtime layer exists to isolate session lifecycle logic from GNU Radio execution details. The current `StubRuntimeManager` succeeds by default and only provides the control-plane seam needed by `SessionService`:

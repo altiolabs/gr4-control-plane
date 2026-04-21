@@ -40,6 +40,7 @@ endif()
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(GTest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system)
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CPPHTTPLIB_OPENSSL REQUIRED IMPORTED_TARGET openssl)
@@ -89,12 +90,15 @@ endif()
 add_library(gr4cp_core
     src/app/block_settings_service.cpp
     src/app/block_catalog_service.cpp
+    src/app/session_stream_service.cpp
     src/api/http_server.cpp
     src/catalog/static_block_catalog_provider.cpp
     src/domain/block_catalog.cpp
     src/domain/session.cpp
+    src/domain/session_stream.cpp
     src/app/session_service.cpp
     src/runtime/gr4_runtime_manager.cpp
+    src/runtime/stream_binding_allocator.cpp
     src/runtime/stub_runtime_manager.cpp
     src/storage/in_memory_session_repository.cpp
 )
@@ -127,6 +131,7 @@ target_include_directories(gr4cp_core
 
 target_link_libraries(gr4cp_core
     PUBLIC
+        Boost::system
         ${GR4CP_HTTPLIB_TARGET}
         PkgConfig::CPPHTTPLIB_OPENSSL
         PkgConfig::CPPHTTPLIB_BROTLICOMMON
@@ -154,6 +159,7 @@ target_include_directories(gr4cp_cli
 
 target_link_libraries(gr4cp_cli
     PUBLIC
+        Boost::system
         ${GR4CP_HTTPLIB_TARGET}
         PkgConfig::CPPHTTPLIB_OPENSSL
         PkgConfig::CPPHTTPLIB_BROTLICOMMON
@@ -213,6 +219,7 @@ endif()
 add_executable(gr4cp_core_test
     test/block_settings_service_test.cpp
     test/session_service_test.cpp
+    test/session_stream_service_test.cpp
     test/block_catalog_service_test.cpp
     test/gr4_block_catalog_provider_test.cpp
     test/gr4_runtime_manager_test.cpp

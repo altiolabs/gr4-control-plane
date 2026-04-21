@@ -1,8 +1,13 @@
 #include "gr4cp/app/session_service.hpp"
 
 #include <chrono>
+#include <condition_variable>
+#include <future>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -13,9 +18,24 @@
 
 namespace {
 
+std::string unsupported_transport_graph() {
+    return R"(blocks:
+  - id: "gr::testing::ManagedStreamBlock<float32>"
+    parameters:
+      name: "spectrum0"
+      stream:
+        transport: "grpc"
+        payload_format: "dataset-xy-json-v1"
+connections: []
+)";
+}
+
 class FakeRuntimeManager final : public gr4cp::runtime::RuntimeManager {
 public:
-    void prepare(const gr4cp::domain::Session&) override {
+    void prepare(const gr4cp::domain::Session& session) override {
+        if (const auto contract_error = gr4cp::domain::validate_stream_runtime_contract(session); contract_error.has_value()) {
+            throw std::runtime_error(*contract_error);
+        }
         record("prepare");
     }
 
@@ -25,10 +45,32 @@ public:
 
     void stop(const gr4cp::domain::Session&) override {
         record("stop");
+        std::unique_lock lock(control_mutex_);
+        stop_entered_ = true;
+        control_condition_.notify_all();
+        control_condition_.wait(lock, [this]() { return !block_stop_; });
     }
 
     void destroy(const gr4cp::domain::Session&) override {
         record("destroy");
+    }
+
+    std::optional<gr4cp::domain::StreamRuntimePlan> active_stream_plan(const gr4cp::domain::Session&) override {
+        return std::nullopt;
+    }
+
+    gr4cp::runtime::HttpStreamResponse fetch_http_stream(const gr4cp::domain::Session&, const std::string&) override {
+        record("fetch_http_stream");
+        if (http_stream_failures_remaining_ > 0) {
+            --http_stream_failures_remaining_;
+            throw std::runtime_error("failed to reach internal HTTP stream endpoint");
+        }
+        return http_stream_response_;
+    }
+
+    gr4cp::runtime::WebSocketStreamRoute resolve_websocket_stream(const gr4cp::domain::Session&,
+                                                                  const std::string&) override {
+        return {};
     }
 
     void set_block_settings(const gr4cp::domain::Session&,
@@ -48,7 +90,31 @@ public:
         fail_message_ = std::move(message);
     }
 
+    void block_stop() {
+        std::lock_guard lock(control_mutex_);
+        block_stop_ = true;
+        stop_entered_ = false;
+    }
+
+    void release_stop() {
+        std::lock_guard lock(control_mutex_);
+        block_stop_ = false;
+        control_condition_.notify_all();
+    }
+
+    bool wait_for_stop_entry(std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+        std::unique_lock lock(control_mutex_);
+        return control_condition_.wait_for(lock, timeout, [this]() { return stop_entered_; });
+    }
+
+    void fail_http_stream_fetches(int attempts) {
+        http_stream_failures_remaining_ = attempts;
+    }
+
     std::vector<std::string> actions;
+    gr4cp::runtime::HttpStreamResponse http_stream_response_{.status = 200,
+                                                             .body = R"({"samples":[1,2,3]})",
+                                                             .content_type = "application/json"};
 
 private:
     void record(const std::string& action) {
@@ -60,6 +126,11 @@ private:
 
     std::string fail_action_;
     std::string fail_message_{"boom"};
+    std::mutex control_mutex_;
+    std::condition_variable control_condition_;
+    bool block_stop_{false};
+    bool stop_entered_{false};
+    int http_stream_failures_remaining_{0};
 };
 
 class SessionServiceTest : public ::testing::Test {
@@ -169,6 +240,31 @@ TEST_F(SessionServiceTest, StopFromStoppedIsNoOpSuccess) {
     EXPECT_TRUE(runtime.actions.empty());
 }
 
+TEST_F(SessionServiceTest, FetchHttpStreamRetriesTransientInternalEndpointFailures) {
+    const auto created = service.create("demo", "graph");
+    service.start(created.id);
+    runtime.actions.clear();
+    runtime.fail_http_stream_fetches(2);
+
+    const auto response = service.fetch_http_stream(created.id, "series0");
+
+    EXPECT_EQ(response.status, 200);
+    EXPECT_EQ(response.body, R"({"samples":[1,2,3]})");
+    EXPECT_EQ(response.content_type, "application/json");
+    EXPECT_EQ(runtime.actions,
+              (std::vector<std::string>{"fetch_http_stream", "fetch_http_stream", "fetch_http_stream"}));
+}
+
+TEST_F(SessionServiceTest, FetchHttpStreamDoesNotRetryNonTransientRuntimeFailures) {
+    const auto created = service.create("demo", "graph");
+    service.start(created.id);
+    runtime.actions.clear();
+    runtime.fail_on("fetch_http_stream", "stream not found in active runtime resources: series0");
+
+    EXPECT_THROW(service.fetch_http_stream(created.id, "series0"), gr4cp::app::RuntimeError);
+    EXPECT_EQ(runtime.actions, (std::vector<std::string>{"fetch_http_stream"}));
+}
+
 TEST_F(SessionServiceTest, RestartFromStopped) {
     const auto created = service.create("demo", "graph");
 
@@ -221,6 +317,64 @@ TEST_F(SessionServiceTest, RuntimeFailureCausesErrorStateAndLastErrorToBeSet) {
     EXPECT_EQ(stored->state, gr4cp::domain::SessionState::Error);
     ASSERT_TRUE(stored->last_error.has_value());
     EXPECT_NE(stored->last_error->find("start exploded"), std::string::npos);
+}
+
+TEST_F(SessionServiceTest, RestartDuringSlowStopIsRejectedDeterministically) {
+    const auto created = service.create("demo", "graph");
+    service.start(created.id);
+    runtime.actions.clear();
+    runtime.block_stop();
+
+    auto stop_future = std::async(std::launch::async, [this, id = created.id]() { return service.stop(id); });
+    ASSERT_TRUE(runtime.wait_for_stop_entry());
+
+    EXPECT_THROW(service.restart(created.id), gr4cp::app::InvalidStateError);
+
+    runtime.release_stop();
+    const auto stopped = stop_future.get();
+    EXPECT_EQ(stopped.state, gr4cp::domain::SessionState::Stopped);
+}
+
+TEST_F(SessionServiceTest, RemoveDuringSlowStopPreservesSessionRecord) {
+    const auto created = service.create("demo", "graph");
+    service.start(created.id);
+    runtime.actions.clear();
+    runtime.block_stop();
+
+    auto stop_future = std::async(std::launch::async, [this, id = created.id]() { return service.stop(id); });
+    ASSERT_TRUE(runtime.wait_for_stop_entry());
+
+    EXPECT_THROW(service.remove(created.id), gr4cp::app::InvalidStateError);
+    EXPECT_TRUE(repository.get(created.id).has_value());
+
+    runtime.release_stop();
+    (void)stop_future.get();
+}
+
+TEST_F(SessionServiceTest, StopFailureMarksSessionAsErrorWithTeardownMessage) {
+    const auto created = service.create("demo", "graph");
+    service.start(created.id);
+    runtime.fail_on("stop", "teardown timed out after 2000 ms");
+
+    EXPECT_THROW(service.stop(created.id), gr4cp::app::RuntimeError);
+
+    const auto stored = repository.get(created.id);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->state, gr4cp::domain::SessionState::Error);
+    ASSERT_TRUE(stored->last_error.has_value());
+    EXPECT_NE(stored->last_error->find("teardown timed out"), std::string::npos);
+}
+
+TEST_F(SessionServiceTest, StartFailsExplicitlyForUnsupportedAuthoredTransport) {
+    const auto created = service.create("demo", unsupported_transport_graph());
+
+    EXPECT_THROW(service.start(created.id), gr4cp::app::RuntimeError);
+
+    const auto stored = repository.get(created.id);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->state, gr4cp::domain::SessionState::Error);
+    ASSERT_TRUE(stored->last_error.has_value());
+    EXPECT_NE(stored->last_error->find("managed stream transport is not supported"), std::string::npos);
 }
 
 }  // namespace
