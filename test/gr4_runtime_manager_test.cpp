@@ -90,6 +90,59 @@ connections:
 )";
 }
 
+std::string compatibility_studio_http_series_graph_yaml() {
+    return R"(blocks:
+  - id: "gr::basic::SignalGenerator<float32>"
+    parameters:
+      name: "src0"
+      sample_rate: 1000.0
+      chunk_size: 32
+      signal_type: "Sin"
+      frequency: 25.0
+      amplitude: 1.0
+      offset: 0.0
+      phase: 0.0
+  - id: "gr::studio::StudioSeriesSink<float32>"
+    parameters:
+      name: "series0"
+      stream:
+        transport: "http_poll"
+        payload_format: "series-window-json-v1"
+      poll_ms: 250
+      window_size: 64
+      channels: 1
+connections:
+  - ["src0", 0, "series0", 0]
+)";
+}
+
+std::string compatibility_studio_http_waterfall_graph_yaml() {
+    return R"(blocks:
+  - id: "gr::basic::SignalGenerator<float32>"
+    parameters:
+      name: "src0"
+      sample_rate: 1000.0
+      chunk_size: 32
+      signal_type: "Sin"
+      frequency: 25.0
+      amplitude: 1.0
+      offset: 0.0
+      phase: 0.0
+  - id: "gr::studio::StudioWaterfallSink<float32>"
+    parameters:
+      name: "waterfall0"
+      stream:
+        transport: "http_poll"
+        payload_format: "waterfall-spectrum-json-v1"
+      poll_ms: 250
+      fft_size: 32
+      sample_rate: 1000.0
+      time_span: 0.256
+connections:
+  - ["src0", 0, "waterfall0", 0]
+)";
+}
+
 class Gr4RuntimeManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -163,7 +216,7 @@ TEST_F(Gr4RuntimeManagerTest, LegacyMinimalGraphShapeIsNormalizedBeforePrepare) 
     EXPECT_NO_THROW(runtime_.destroy(session));
 }
 
-TEST_F(Gr4RuntimeManagerTest, StudioInlineGraphShapeIsNormalizedBeforePrepare) {
+TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioInlineGraphShapeIsNormalizedBeforePrepare) {
     auto session = make_session("runtime_studio_graph", studio_inline_graph_yaml());
 
     EXPECT_NO_THROW(runtime_.prepare(session));
@@ -196,7 +249,7 @@ TEST_F(Gr4RuntimeManagerTest, RunningSessionSupportsBlockSettingsMessageRoundTri
     runtime_.destroy(session);
 }
 
-TEST_F(Gr4RuntimeManagerTest, RunningSessionResolvesStudioBlockNameForSettingsRoundTrip) {
+TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioBlockNameResolvesForSettingsRoundTrip) {
     auto session = make_session("runtime_studio_name_settings", R"(blocks:
   - id: "gr::basic::SignalGenerator<float32>"
     parameters:
@@ -273,6 +326,56 @@ TEST_F(Gr4RuntimeManagerTest, MissingBlockSettingsLookupIncludesAvailableRuntime
         EXPECT_NE(message.find("src0"), std::string::npos);
         EXPECT_NE(message.find("sink0"), std::string::npos);
     }
+
+    runtime_.stop(session);
+    runtime_.destroy(session);
+}
+
+TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioSeriesSinkHttpStreamCanBeFetchedFromRuntimeBinding) {
+    auto session = make_session("runtime_managed_http_series", compatibility_studio_http_series_graph_yaml());
+
+    runtime_.prepare(session);
+    runtime_.start(session);
+    std::this_thread::sleep_for(250ms);
+
+    const auto plan = runtime_.active_stream_plan(session);
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->streams.size(), 1U);
+    EXPECT_EQ(plan->streams.front().stream_id, "series0");
+    EXPECT_EQ(plan->streams.front().transport, "http_poll");
+    EXPECT_EQ(plan->streams.front().path, "/sessions/runtime_managed_http_series/streams/series0/http");
+
+    const auto stream = runtime_.fetch_http_stream(session, "series0");
+    EXPECT_EQ(stream.status, 200);
+    EXPECT_EQ(stream.content_type, "application/json");
+    EXPECT_NE(stream.body.find("\"sample_type\":\"float32\""), std::string::npos);
+    EXPECT_NE(stream.body.find("\"layout\":\"channels_first\""), std::string::npos);
+    EXPECT_NE(stream.body.find("\"data\":["), std::string::npos);
+
+    runtime_.stop(session);
+    runtime_.destroy(session);
+}
+
+TEST_F(Gr4RuntimeManagerTest, CompatibilityStudioWaterfallSinkHttpStreamCanBeFetchedFromRuntimeBinding) {
+    auto session = make_session("runtime_managed_http_waterfall", compatibility_studio_http_waterfall_graph_yaml());
+
+    runtime_.prepare(session);
+    runtime_.start(session);
+    std::this_thread::sleep_for(250ms);
+
+    const auto plan = runtime_.active_stream_plan(session);
+    ASSERT_TRUE(plan.has_value());
+    ASSERT_EQ(plan->streams.size(), 1U);
+    EXPECT_EQ(plan->streams.front().stream_id, "waterfall0");
+    EXPECT_EQ(plan->streams.front().transport, "http_poll");
+    EXPECT_EQ(plan->streams.front().payload_format, "waterfall-spectrum-json-v1");
+    EXPECT_EQ(plan->streams.front().path, "/sessions/runtime_managed_http_waterfall/streams/waterfall0/http");
+
+    const auto stream = runtime_.fetch_http_stream(session, "waterfall0");
+    EXPECT_EQ(stream.status, 200);
+    EXPECT_EQ(stream.content_type, "application/json");
+    EXPECT_NE(stream.body.find("\"payload_format\":\"waterfall-spectrum-json-v1\""), std::string::npos);
+    EXPECT_NE(stream.body.find("\"layout\":\"waterfall_matrix\""), std::string::npos);
 
     runtime_.stop(session);
     runtime_.destroy(session);

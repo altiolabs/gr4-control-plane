@@ -1,6 +1,7 @@
 #include "gr4cp/app/block_catalog_service.hpp"
 #include "gr4cp/app/block_settings_service.hpp"
 #include "gr4cp/app/session_service.hpp"
+#include "gr4cp/app/session_stream_service.hpp"
 #include "gr4cp/api/http_server.hpp"
 #include "gr4cp/catalog/gr4_block_catalog_provider.hpp"
 #include "gr4cp/runtime/gr4_runtime_manager.hpp"
@@ -21,6 +22,7 @@ int main() {
     gr4cp::storage::InMemorySessionRepository repository;
     gr4cp::runtime::Gr4RuntimeManager runtime_manager;
     gr4cp::app::SessionService session_service(repository, runtime_manager);
+    gr4cp::app::SessionStreamService session_stream_service;
     gr4cp::app::BlockSettingsService block_settings_service(repository, runtime_manager);
     gr4cp::catalog::Gr4BlockCatalogProvider block_catalog_provider;
     gr4cp::app::BlockCatalogService block_catalog_service(block_catalog_provider);
@@ -33,8 +35,10 @@ int main() {
         return 1;
     }
 
-    httplib::Server server;
-    gr4cp::api::register_routes(server, session_service, block_catalog_service, block_settings_service);
+    gr4cp::api::HttpServer server(session_service,
+                                  session_stream_service,
+                                  block_catalog_service,
+                                  block_settings_service);
 
     const char* port_env = std::getenv("GR4CP_PORT");
     const int port = port_env != nullptr ? std::stoi(port_env) : 8080;

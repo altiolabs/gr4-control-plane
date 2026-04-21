@@ -1,9 +1,24 @@
 #include "gr4cp/api/http_server.hpp"
 
+#include <atomic>
+#include <cctype>
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <string>
-#include <vector>
 #include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/beast/websocket.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -12,6 +27,30 @@ namespace gr4cp::api {
 namespace {
 
 using Json = nlohmann::json;
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+using tcp = asio::ip::tcp;
+
+Json stream_to_json(const domain::BrowserStreamDescriptor& stream) {
+    return Json{
+        {"id", stream.id},
+        {"block_instance_name", stream.block_instance_name},
+        {"transport", stream.transport},
+        {"payload_format", stream.payload_format},
+        {"path", stream.path},
+        {"ready", stream.ready},
+    };
+}
+
+Json stream_plan_to_json(const domain::StreamRuntimePlan& plan) {
+    auto body = Json::array();
+    for (const auto& stream_plan : plan.streams) {
+        body.push_back(stream_to_json(domain::to_browser_stream_descriptor(stream_plan)));
+    }
+    return body;
+}
 
 Json block_parameter_default_to_json(const domain::BlockParameterDefault& value) {
     return std::visit([](const auto& item) -> Json { return item; }, value);
@@ -118,8 +157,8 @@ Json blocks_to_json(const std::vector<domain::BlockDescriptor>& blocks) {
     return body;
 }
 
-Json session_to_json(const domain::Session& session) {
-    return Json{
+Json session_to_json(const domain::Session& session, const std::optional<domain::StreamRuntimePlan>& stream_plan = std::nullopt) {
+    auto body = Json{
         {"id", session.id},
         {"name", session.name},
         {"state", domain::to_string(session.state)},
@@ -127,12 +166,20 @@ Json session_to_json(const domain::Session& session) {
         {"updated_at", domain::format_timestamp_utc(session.updated_at)},
         {"last_error", session.last_error ? Json(*session.last_error) : Json(nullptr)},
     };
+
+    if (stream_plan.has_value()) {
+        body["streams"] = stream_plan_to_json(*stream_plan);
+    }
+
+    return body;
 }
 
-Json sessions_to_json(const std::vector<domain::Session>& sessions) {
+Json sessions_to_json(const std::vector<domain::Session>& sessions,
+                      const std::vector<std::optional<domain::StreamRuntimePlan>>& stream_plans) {
     auto body = Json::array();
-    for (const auto& session : sessions) {
-        body.push_back(session_to_json(session));
+    for (std::size_t index = 0; index < sessions.size(); ++index) {
+        const auto& plan = index < stream_plans.size() ? stream_plans[index] : std::optional<domain::StreamRuntimePlan>{};
+        body.push_back(session_to_json(sessions[index], plan));
     }
     return body;
 }
@@ -161,6 +208,18 @@ void set_error_response(httplib::Response& response,
 void set_no_content_response(httplib::Response& response) {
     response.status = 204;
     response.body.clear();
+}
+
+void set_http_stream_response(httplib::Response& response, const runtime::HttpStreamResponse& stream_response) {
+    response.status = stream_response.status;
+    response.set_content(stream_response.body, stream_response.content_type);
+}
+
+bool is_websocket_upgrade_request(const httplib::Request& request) {
+    const auto upgrade = request.get_header_value("Upgrade");
+    const auto connection = request.get_header_value("Connection");
+    return upgrade == "websocket" &&
+           (connection.find("Upgrade") != std::string::npos || connection.find("upgrade") != std::string::npos);
 }
 
 Json parse_json_body(const httplib::Request& request) {
@@ -224,26 +283,37 @@ std::string decode_percent_encoded(std::string_view value) {
     return decoded;
 }
 
-void handle_exception(httplib::Response& response) {
+struct ErrorDetails {
+    int status;
+    std::string code;
+    std::string message;
+};
+
+ErrorDetails current_error_details() {
     try {
         throw;
     } catch (const app::ValidationError& error) {
-        set_error_response(response, 400, "validation_error", error.what());
+        return {400, "validation_error", error.what()};
     } catch (const app::NotFoundError& error) {
-        set_error_response(response, 404, "not_found", error.what());
+        return {404, "not_found", error.what()};
     } catch (const app::InvalidStateError& error) {
-        set_error_response(response, 409, "invalid_state", error.what());
+        return {409, "invalid_state", error.what()};
     } catch (const app::RuntimeError& error) {
-        set_error_response(response, 500, "runtime_error", error.what());
+        return {500, "runtime_error", error.what()};
     } catch (const app::TimeoutError& error) {
-        set_error_response(response, 504, "timeout", error.what());
+        return {504, "timeout", error.what()};
     } catch (const catalog::CatalogLoadError& error) {
-        set_error_response(response, 500, "catalog_error", error.what());
+        return {500, "catalog_error", error.what()};
     } catch (const std::exception&) {
-        set_error_response(response, 500, "internal_error", "internal server error");
+        return {500, "internal_error", "internal server error"};
     } catch (...) {
-        set_error_response(response, 500, "internal_error", "internal server error");
+        return {500, "internal_error", "internal server error"};
     }
+}
+
+void handle_exception(httplib::Response& response) {
+    const auto details = current_error_details();
+    set_error_response(response, details.status, details.code, details.message);
 }
 
 template <typename Action>
@@ -255,10 +325,32 @@ void execute(httplib::Response& response, Action&& action) {
     }
 }
 
+bool proxy_debug_enabled() {
+    if (const char* env = std::getenv("GR4CP_PROXY_DEBUG"); env != nullptr) {
+        return *env != '\0' && std::string_view(env) != "0";
+    }
+    return false;
+}
+
+void proxy_debug(std::string_view message) {
+    if (!proxy_debug_enabled()) {
+        return;
+    }
+    std::clog << "[gr4cp proxy] " << message << '\n';
+}
+
+std::string proxy_error_message(const httplib::Result& result) {
+    if (result) {
+        return "success";
+    }
+    return httplib::to_string(result.error());
+}
+
 }  // namespace
 
 void register_routes(httplib::Server& server,
                      app::SessionService& session_service,
+                     app::SessionStreamService&,
                      app::BlockCatalogService& block_catalog_service,
                      app::BlockSettingsService& block_settings_service) {
     server.Get("/healthz", [](const httplib::Request&, httplib::Response& response) {
@@ -290,14 +382,50 @@ void register_routes(httplib::Server& server,
 
     server.Get("/sessions", [&session_service](const httplib::Request&, httplib::Response& response) {
         execute(response, [&]() {
-            set_json_response(response, sessions_to_json(session_service.list()));
+            const auto sessions = session_service.list();
+            std::vector<std::optional<domain::StreamRuntimePlan>> stream_plans;
+            stream_plans.reserve(sessions.size());
+            for (const auto& session : sessions) {
+                stream_plans.push_back(session_service.active_stream_plan(session.id));
+            }
+            set_json_response(response, sessions_to_json(sessions, stream_plans));
         });
     });
+
+    server.Get(R"(/sessions/([A-Za-z0-9_]+)/streams/(.+)/http)",
+               [&session_service](const httplib::Request& request, httplib::Response& response) {
+                   execute(response, [&]() {
+                       set_http_stream_response(
+                           response,
+                           session_service.fetch_http_stream(request.matches[1].str(),
+                                                             decode_percent_encoded(request.matches[2].str())));
+                   });
+               });
+
+    server.Get(R"(/sessions/([A-Za-z0-9_]+)/streams/(.+)/ws)",
+               [&session_service](const httplib::Request& request, httplib::Response& response) {
+                   execute(response, [&]() {
+                       (void)session_service.resolve_websocket_stream(request.matches[1].str(),
+                                                                     decode_percent_encoded(request.matches[2].str()));
+                       if (!is_websocket_upgrade_request(request)) {
+                           response.status = 426;
+                           response.set_header("Upgrade", "websocket");
+                           response.set_header("Connection", "Upgrade");
+                           response.set_content("", "text/plain");
+                           return;
+                       }
+                       set_error_response(response,
+                                          501,
+                                          "not_implemented",
+                                          "websocket proxy upgrade is not implemented on the current server stack");
+                   });
+               });
 
     server.Get(R"(/sessions/([A-Za-z0-9_]+))",
                [&session_service](const httplib::Request& request, httplib::Response& response) {
                    execute(response, [&]() {
-                       set_json_response(response, session_to_json(session_service.get(request.matches[1].str())));
+                       const auto session = session_service.get(request.matches[1].str());
+                       set_json_response(response, session_to_json(session, session_service.active_stream_plan(session.id)));
                    });
                });
 
@@ -356,6 +484,491 @@ void register_routes(httplib::Server& server,
                                          Json{{"settings", block_settings_service.get(session_id, block_unique_name)}});
                    });
                });
+}
+
+std::optional<std::pair<std::string, std::string>> parse_websocket_stream_target(std::string_view target) {
+    const auto route = target.substr(0, target.find('?'));
+    constexpr std::string_view prefix = "/sessions/";
+    constexpr std::string_view infix = "/streams/";
+    constexpr std::string_view suffix = "/ws";
+
+    if (!route.starts_with(prefix) || !route.ends_with(suffix)) {
+        return std::nullopt;
+    }
+
+    const auto infix_pos = route.find(infix, prefix.size());
+    if (infix_pos == std::string_view::npos || infix_pos <= prefix.size()) {
+        return std::nullopt;
+    }
+
+    const auto session_id = route.substr(prefix.size(), infix_pos - prefix.size());
+    const auto stream_begin = infix_pos + infix.size();
+    const auto stream_end = route.size() - suffix.size();
+    if (stream_begin >= stream_end || session_id.find('/') != std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    return std::pair{std::string(session_id), decode_percent_encoded(route.substr(stream_begin, stream_end - stream_begin))};
+}
+
+httplib::Headers to_httplib_headers(const http::fields& fields) {
+    httplib::Headers headers;
+    for (const auto& field : fields) {
+        const auto name = std::string(field.name_string());
+        if (name == "Host" || name == "Connection" || name == "Upgrade" || name == "Content-Length") {
+            continue;
+        }
+        headers.emplace(name, std::string(field.value()));
+    }
+    return headers;
+}
+
+http::response<http::string_body> make_beast_response(const httplib::Response& upstream, const unsigned version) {
+    http::response<http::string_body> response;
+    response.version(version);
+    response.result(static_cast<http::status>(upstream.status));
+    response.body() = upstream.body;
+    for (const auto& [name, value] : upstream.headers) {
+        if (name == "Content-Length" || name == "Transfer-Encoding" || name == "Connection") {
+            continue;
+        }
+        response.set(name, value);
+    }
+    response.keep_alive(false);
+    response.prepare_payload();
+    return response;
+}
+
+void write_response_and_close(tcp::socket& socket, http::response<http::string_body>& response) {
+    beast::error_code error;
+    http::write(socket, response, error);
+    socket.shutdown(tcp::socket::shutdown_both, error);
+    socket.close(error);
+}
+
+void write_json_error(tcp::socket& socket, const unsigned version, const ErrorDetails& details) {
+    http::response<http::string_body> response{static_cast<http::status>(details.status), version};
+    response.set(http::field::content_type, "application/json");
+    response.body() = Json{{"error", {{"code", details.code}, {"message", details.message}}}}.dump();
+    response.keep_alive(false);
+    response.prepare_payload();
+    write_response_and_close(socket, response);
+}
+
+std::optional<tcp::endpoint> endpoint_for_host(const std::string& host, const unsigned short port) {
+    if (host == "0.0.0.0") {
+        return tcp::endpoint{tcp::v4(), port};
+    }
+    if (host == "::") {
+        return tcp::endpoint{tcp::v6(), port};
+    }
+
+    beast::error_code error;
+    const auto address = asio::ip::make_address(host, error);
+    if (error) {
+        return std::nullopt;
+    }
+    return tcp::endpoint{address, port};
+}
+
+class WebSocketBridge {
+public:
+    WebSocketBridge(websocket::stream<beast::tcp_stream>&& browser,
+                    websocket::stream<beast::tcp_stream>&& internal)
+        : browser_(std::move(browser)), internal_(std::move(internal)) {}
+
+    void run() {
+        std::jthread browser_to_internal([this]() { forward(browser_, internal_); });
+        std::jthread internal_to_browser([this]() { forward(internal_, browser_); });
+        browser_to_internal.join();
+        internal_to_browser.join();
+        close();
+    }
+
+    void close() {
+        std::lock_guard lock(close_mutex_);
+        if (closed_.exchange(true)) {
+            return;
+        }
+
+        beast::error_code error;
+        browser_.next_layer().socket().shutdown(tcp::socket::shutdown_both, error);
+        browser_.next_layer().socket().close(error);
+        internal_.next_layer().socket().shutdown(tcp::socket::shutdown_both, error);
+        internal_.next_layer().socket().close(error);
+    }
+
+private:
+    static bool is_expected_close(const beast::error_code& error) {
+        return error == websocket::error::closed || error == asio::error::operation_aborted ||
+               error == beast::http::error::end_of_stream;
+    }
+
+    void forward(websocket::stream<beast::tcp_stream>& source, websocket::stream<beast::tcp_stream>& destination) {
+        try {
+            for (;;) {
+                beast::flat_buffer buffer;
+                source.read(buffer);
+                destination.text(source.got_text());
+                destination.write(buffer.data());
+            }
+        } catch (const beast::system_error& error) {
+            if (!is_expected_close(error.code())) {
+                close();
+                return;
+            }
+        } catch (...) {
+            close();
+            return;
+        }
+        close();
+    }
+
+    websocket::stream<beast::tcp_stream> browser_;
+    websocket::stream<beast::tcp_stream> internal_;
+    std::atomic<bool> closed_{false};
+    std::mutex close_mutex_;
+};
+
+struct gr4cp::api::HttpServer::Impl {
+    Impl(app::SessionService& session_service_ref,
+         app::SessionStreamService& session_stream_service,
+         app::BlockCatalogService& block_catalog_service,
+         app::BlockSettingsService& block_settings_service)
+        : session_service(session_service_ref) {
+        register_routes(internal_server,
+                        session_service_ref,
+                        session_stream_service,
+                        block_catalog_service,
+                        block_settings_service);
+    }
+
+    ~Impl() {
+        stop();
+    }
+
+    int bind_to_any_port(const std::string& host) {
+        ensure_internal_bound();
+        const auto endpoint = endpoint_for_host(host, 0);
+        if (!endpoint.has_value()) {
+            return -1;
+        }
+
+        beast::error_code error;
+        acceptor_ = std::make_unique<tcp::acceptor>(io_context_);
+        acceptor_->open(endpoint->protocol(), error);
+        if (error) {
+            return -1;
+        }
+        acceptor_->set_option(asio::socket_base::reuse_address(true), error);
+        if (error) {
+            return -1;
+        }
+        acceptor_->bind(*endpoint, error);
+        if (error) {
+            return -1;
+        }
+        acceptor_->listen(asio::socket_base::max_listen_connections, error);
+        if (error) {
+            return -1;
+        }
+        acceptor_->non_blocking(true, error);
+        if (error) {
+            return -1;
+        }
+        return static_cast<int>(acceptor_->local_endpoint().port());
+    }
+
+    bool listen(const std::string& host, const int port) {
+        ensure_internal_bound();
+        const auto endpoint = endpoint_for_host(host, static_cast<unsigned short>(port));
+        if (!endpoint.has_value()) {
+            return false;
+        }
+
+        beast::error_code error;
+        acceptor_ = std::make_unique<tcp::acceptor>(io_context_);
+        acceptor_->open(endpoint->protocol(), error);
+        if (error) {
+            return false;
+        }
+        acceptor_->set_option(asio::socket_base::reuse_address(true), error);
+        if (error) {
+            return false;
+        }
+        acceptor_->bind(*endpoint, error);
+        if (error) {
+            return false;
+        }
+        acceptor_->listen(asio::socket_base::max_listen_connections, error);
+        if (error) {
+            return false;
+        }
+        acceptor_->non_blocking(true, error);
+        if (error) {
+            return false;
+        }
+        return listen_after_bind();
+    }
+
+    bool listen_after_bind() {
+        ensure_internal_bound();
+        start_internal_server();
+        stopping_.store(false);
+
+        while (!stopping_.load()) {
+            beast::error_code error;
+            tcp::socket socket(io_context_);
+            acceptor_->accept(socket, error);
+            if (error) {
+                if (error == asio::error::would_block || error == asio::error::try_again) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+                if (stopping_.load() || error == asio::error::operation_aborted || error == asio::error::bad_descriptor) {
+                    break;
+                }
+                continue;
+            }
+
+            std::lock_guard lock(connection_mutex_);
+            connection_threads_.emplace_back([this, socket = std::move(socket)]() mutable { handle_connection(std::move(socket)); });
+        }
+
+        join_connection_threads();
+        stop_internal_server();
+        return true;
+    }
+
+    void stop() {
+        if (stopping_.exchange(true)) {
+            return;
+        }
+
+        internal_server.stop();
+
+        if (acceptor_) {
+            beast::error_code error;
+            acceptor_->cancel(error);
+            acceptor_->close(error);
+        }
+
+        std::vector<std::shared_ptr<WebSocketBridge>> bridges;
+        {
+            std::lock_guard lock(bridge_mutex_);
+            bridges.assign(active_bridges_.begin(), active_bridges_.end());
+        }
+        for (const auto& bridge : bridges) {
+            bridge->close();
+        }
+
+        join_connection_threads();
+        stop_internal_server();
+    }
+
+    app::SessionService& session_service;
+    httplib::Server internal_server;
+    int internal_port_{0};
+
+private:
+    void ensure_internal_bound() {
+        if (internal_port_ == 0) {
+            internal_port_ = internal_server.bind_to_any_port("127.0.0.1");
+        }
+    }
+
+    void start_internal_server() {
+        if (!internal_thread_.joinable()) {
+            internal_thread_ = std::jthread([this]() { internal_server.listen_after_bind(); });
+            wait_for_internal_server_ready();
+        }
+    }
+
+    void wait_for_internal_server_ready() {
+        httplib::Client client("127.0.0.1", internal_port_);
+        client.set_connection_timeout(0, 200000);
+        client.set_read_timeout(0, 200000);
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            const auto response = client.Get("/healthz");
+            if (response && response->status == 200) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    void stop_internal_server() {
+        if (internal_thread_.joinable()) {
+            internal_thread_.join();
+        }
+    }
+
+    void join_connection_threads() {
+        std::vector<std::jthread> threads;
+        {
+            std::lock_guard lock(connection_mutex_);
+            threads.swap(connection_threads_);
+        }
+        threads.clear();
+    }
+
+    void handle_connection(tcp::socket socket) {
+        beast::flat_buffer buffer;
+        http::request<http::string_body> request;
+        beast::error_code error;
+        http::read(socket, buffer, request, error);
+        if (error) {
+            return;
+        }
+
+        const auto websocket_route = websocket::is_upgrade(request) ? parse_websocket_stream_target(request.target()) : std::nullopt;
+        if (websocket_route.has_value()) {
+            handle_websocket_upgrade(std::move(socket), std::move(request), websocket_route->first, websocket_route->second);
+            return;
+        }
+
+        proxy_http_request(std::move(socket), request);
+    }
+
+    void proxy_http_request(tcp::socket socket, const http::request<http::string_body>& request) {
+        static constexpr auto kInternalRouteReadTimeout = std::chrono::seconds(45);
+
+        httplib::Client client("127.0.0.1", internal_port_);
+        client.set_connection_timeout(1, 0);
+        client.set_read_timeout(kInternalRouteReadTimeout.count(), 0);
+        client.set_keep_alive(false);
+        const auto headers = to_httplib_headers(request.base());
+        const auto path = std::string(request.target());
+        proxy_debug("public_path=" + path + " internal_route=http://127.0.0.1:" + std::to_string(internal_port_) + path);
+
+        httplib::Result upstream;
+        switch (request.method()) {
+            case http::verb::get:
+                upstream = client.Get(path, headers);
+                break;
+            case http::verb::post: {
+                auto content_type = std::string(request[http::field::content_type]);
+                if (content_type.empty()) {
+                    content_type = "application/json";
+                }
+                upstream = client.Post(path, headers, request.body(), std::string(content_type));
+                break;
+            }
+            case http::verb::delete_:
+                upstream = client.Delete(path, headers);
+                break;
+            default: {
+                http::response<http::string_body> response{http::status::method_not_allowed, request.version()};
+                response.set(http::field::content_type, "text/plain");
+                response.body() = "method not allowed";
+                response.keep_alive(false);
+                response.prepare_payload();
+                write_response_and_close(socket, response);
+                return;
+            }
+        }
+
+        if (!upstream) {
+            const auto error = proxy_error_message(upstream);
+            proxy_debug("internal_route_failed path=" + path + " error=" + error);
+            http::response<http::string_body> response{http::status::bad_gateway, request.version()};
+            response.set(http::field::content_type, "application/json");
+            response.body() =
+                Json{{"error", {{"code", "bad_gateway"}, {"message", "failed to reach internal HTTP route: " + error}}}}.dump();
+            response.keep_alive(false);
+            response.prepare_payload();
+            write_response_and_close(socket, response);
+            return;
+        }
+
+        proxy_debug("internal_route_status path=" + path + " status=" + std::to_string(upstream->status));
+
+        auto response = make_beast_response(*upstream, request.version());
+        write_response_and_close(socket, response);
+    }
+
+    void handle_websocket_upgrade(tcp::socket socket,
+                                  http::request<http::string_body> request,
+                                  const std::string& session_id,
+                                  const std::string& stream_id) {
+        runtime::WebSocketStreamRoute route;
+        try {
+            route = session_service.resolve_websocket_stream(session_id, stream_id);
+        } catch (...) {
+            write_json_error(socket, request.version(), current_error_details());
+            return;
+        }
+
+        websocket::stream<beast::tcp_stream> internal(asio::make_strand(io_context_));
+        try {
+            tcp::resolver resolver(io_context_);
+            const auto endpoint = resolver.resolve(route.internal.host, std::to_string(route.internal.port));
+            beast::get_lowest_layer(internal).connect(endpoint);
+            internal.handshake(route.internal.host + ":" + std::to_string(route.internal.port), route.internal.path);
+        } catch (const std::exception& error) {
+            write_json_error(socket,
+                             request.version(),
+                             ErrorDetails{500, "runtime_error", std::string("failed to attach internal websocket stream: ") + error.what()});
+            return;
+        }
+
+        websocket::stream<beast::tcp_stream> browser(std::move(socket));
+        try {
+            browser.accept(request);
+        } catch (...) {
+            beast::error_code error;
+            internal.next_layer().socket().shutdown(tcp::socket::shutdown_both, error);
+            internal.next_layer().socket().close(error);
+            return;
+        }
+
+        auto bridge = std::make_shared<WebSocketBridge>(std::move(browser), std::move(internal));
+        {
+            std::lock_guard lock(bridge_mutex_);
+            active_bridges_.insert(bridge);
+        }
+        bridge->run();
+        {
+            std::lock_guard lock(bridge_mutex_);
+            active_bridges_.erase(bridge);
+        }
+    }
+
+    asio::io_context io_context_{1};
+    std::unique_ptr<tcp::acceptor> acceptor_;
+    std::atomic<bool> stopping_{true};
+    std::jthread internal_thread_;
+    std::mutex connection_mutex_;
+    std::vector<std::jthread> connection_threads_;
+    std::mutex bridge_mutex_;
+    std::set<std::shared_ptr<WebSocketBridge>> active_bridges_;
+};
+
+gr4cp::api::HttpServer::HttpServer(app::SessionService& session_service,
+                                   app::SessionStreamService& session_stream_service,
+                                   app::BlockCatalogService& block_catalog_service,
+                                   app::BlockSettingsService& block_settings_service)
+    : impl_(std::make_unique<Impl>(session_service,
+                                   session_stream_service,
+                                   block_catalog_service,
+                                   block_settings_service)) {}
+
+gr4cp::api::HttpServer::~HttpServer() = default;
+
+int gr4cp::api::HttpServer::bind_to_any_port(const std::string& host) {
+    return impl_->bind_to_any_port(host);
+}
+
+bool gr4cp::api::HttpServer::listen_after_bind() {
+    return impl_->listen_after_bind();
+}
+
+bool gr4cp::api::HttpServer::listen(const std::string& host, const int port) {
+    return impl_->listen(host, port);
+}
+
+void gr4cp::api::HttpServer::stop() {
+    impl_->stop();
 }
 
 }  // namespace gr4cp::api

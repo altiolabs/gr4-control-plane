@@ -1,5 +1,7 @@
 #include "gr4cp/app/block_settings_service.hpp"
 
+#include <optional>
+#include <string>
 #include <unordered_map>
 
 #include <gtest/gtest.h>
@@ -16,6 +18,16 @@ public:
     void start(const gr4cp::domain::Session&) override {}
     void stop(const gr4cp::domain::Session&) override {}
     void destroy(const gr4cp::domain::Session&) override {}
+    std::optional<gr4cp::domain::StreamRuntimePlan> active_stream_plan(const gr4cp::domain::Session&) override {
+        return std::nullopt;
+    }
+    gr4cp::runtime::HttpStreamResponse fetch_http_stream(const gr4cp::domain::Session&, const std::string&) override {
+        return {};
+    }
+    gr4cp::runtime::WebSocketStreamRoute resolve_websocket_stream(const gr4cp::domain::Session&,
+                                                                  const std::string&) override {
+        return {};
+    }
 
     void set_block_settings(const gr4cp::domain::Session& session,
                             const std::string& block_unique_name,

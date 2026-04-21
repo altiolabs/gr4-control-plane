@@ -1,13 +1,16 @@
 #include "gr4cp/runtime/gr4_runtime_manager.hpp"
 
 #include <chrono>
+#include <concepts>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
+#include <ranges>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -28,6 +31,7 @@
 #include <gnuradio-4.0/PluginLoader.hpp>
 #include <gnuradio-4.0/Scheduler.hpp>
 #include <gnuradio-4.0/YamlPmt.hpp>
+#include <httplib.h>
 
 namespace gr4cp::runtime {
 
@@ -69,6 +73,20 @@ std::vector<std::filesystem::path> split_plugin_directories(std::string_view pat
         start = end + 1;
     }
     return directories;
+}
+
+bool stream_debug_enabled() {
+    if (const char* env = std::getenv("GR4CP_STREAM_DEBUG"); env != nullptr) {
+        return *env != '\0' && std::string_view(env) != "0";
+    }
+    return false;
+}
+
+void stream_debug(std::string_view message) {
+    if (!stream_debug_enabled()) {
+        return;
+    }
+    std::clog << "[gr4cp stream] " << message << '\n';
 }
 
 void prepend_library_search_path(const std::vector<std::filesystem::path>& plugin_directories) {
@@ -473,7 +491,68 @@ bool normalize_connection(gr::pmt::Value& connection) {
     return true;
 }
 
-std::string normalize_graph_content(std::string_view content) {
+bool inject_stream_bindings(gr::property_map& root, const std::vector<domain::RuntimeStreamBinding>& bindings) {
+    if (bindings.empty()) {
+        return false;
+    }
+
+    auto it = root.find("blocks");
+    if (it == root.end()) {
+        return false;
+    }
+    auto* blocks = it->second.get_if<gr::Tensor<gr::pmt::Value>>();
+    if (blocks == nullptr) {
+        return false;
+    }
+
+    bool changed = false;
+    std::set<std::string> injected_stream_ids;
+    for (auto& block_value : *blocks) {
+        auto* block = block_value.get_if<gr::property_map>();
+        if (block == nullptr) {
+            continue;
+        }
+
+        gr::property_map parameters;
+        if (const auto parameters_it = block->find("parameters"); parameters_it != block->end()) {
+            if (const auto* existing = parameters_it->second.get_if<gr::property_map>(); existing != nullptr) {
+                parameters = *existing;
+            }
+        }
+
+        std::optional<std::string> name;
+        if (const auto name_it = parameters.find("name"); name_it != parameters.end()) {
+            name = value_to_string(name_it->second);
+        }
+        if (!name.has_value() || name->empty()) {
+            if (const auto instance_it = block->find("instance_name"); instance_it != block->end()) {
+                name = value_to_string(instance_it->second);
+            }
+        }
+        if (!name.has_value() || name->empty()) {
+            continue;
+        }
+
+        for (const auto& binding : bindings) {
+            if (binding.plan.block_instance_name != *name) {
+                continue;
+            }
+            parameters["endpoint"] = binding.internal.endpoint;
+            (*block)["parameters"] = parameters;
+            injected_stream_ids.insert(binding.plan.stream_id);
+            changed = true;
+            break;
+        }
+    }
+
+    if (injected_stream_ids.size() != bindings.size()) {
+        throw std::runtime_error("failed to inject all managed stream bindings into runtime graph");
+    }
+
+    return changed;
+}
+
+std::string normalize_graph_content(std::string_view content, const std::vector<domain::RuntimeStreamBinding>& bindings = {}) {
     const auto parsed = gr::pmt::yaml::deserialize(content);
     if (!parsed.has_value()) {
         return std::string(content);
@@ -501,6 +580,8 @@ std::string normalize_graph_content(std::string_view content) {
             }
         }
     }
+
+    changed = inject_stream_bindings(root, bindings) || changed;
 
     return changed ? gr::pmt::yaml::serialize(root) : std::string(content);
 }
@@ -556,30 +637,52 @@ gr::property_map parse_settings_reply(const gr::Message& reply, std::string_view
 struct Gr4RuntimeManager::Execution {
     std::unique_ptr<gr::scheduler::Simple<>> scheduler;
     std::thread worker;
-    std::mutex mutex;
-    std::optional<std::string> async_error;
     bool running{false};
+    bool worker_finished{true};
+};
+
+struct Gr4RuntimeManager::SessionRuntimeResources {
+    std::string session_id;
+    std::uint64_t generation{0};
+    LifecyclePhase lifecycle_phase{LifecyclePhase::Idle};
+    bool teardown_complete{true};
+    std::optional<std::string> teardown_error;
+    std::optional<std::string> async_error;
+    std::unique_ptr<Execution> execution;
+    std::vector<domain::RuntimeStreamBinding> stream_bindings;
+    std::mutex mutex;
+    std::condition_variable condition;
 };
 
 Gr4RuntimeManager::Gr4RuntimeManager(std::vector<std::filesystem::path> plugin_directories)
     : plugin_directories_(plugin_directories.empty() ? default_plugin_directories() : std::move(plugin_directories)) {}
 
 Gr4RuntimeManager::~Gr4RuntimeManager() {
-    std::lock_guard lock(mutex_);
-    for (auto& [session_id, execution] : executions_) {
-        if (!execution) {
+    std::vector<std::shared_ptr<SessionRuntimeResources>> resources;
+    {
+        std::lock_guard lock(resources_mutex_);
+        resources.reserve(resources_.size());
+        for (const auto& [_, resource] : resources_) {
+            resources.push_back(resource);
+        }
+        resources_.clear();
+    }
+
+    for (const auto& resource : resources) {
+        if (!resource) {
             continue;
         }
         try {
             domain::Session session;
-            session.id = session_id;
-            stop_locked(session, *execution);
+            session.id = resource->session_id;
+            std::unique_lock resource_lock(resource->mutex);
+            stop_locked(session, *resource, resource_lock);
         } catch (...) {
         }
-        static auto* retired = new std::vector<std::unique_ptr<Execution>>();
-        retired->push_back(std::move(execution));
+
+        std::unique_lock resource_lock(resource->mutex);
+        join_worker_if_needed(*resource, resource_lock);
     }
-    executions_.clear();
 }
 
 std::vector<std::filesystem::path> Gr4RuntimeManager::default_plugin_directories() {
@@ -594,65 +697,202 @@ std::vector<std::filesystem::path> Gr4RuntimeManager::default_plugin_directories
 }
 
 void Gr4RuntimeManager::prepare(const domain::Session& session) {
-    std::lock_guard lock(mutex_);
-    (void)prepare_locked(session);
+    auto resources = get_or_create_resources(session);
+    std::lock_guard resource_lock(resources->mutex);
+    (void)prepare_locked(session, *resources);
 }
 
 void Gr4RuntimeManager::start(const domain::Session& session) {
-    std::lock_guard lock(mutex_);
-    auto& execution = prepare_locked(session);
+    auto resources = get_or_create_resources(session);
+    std::unique_lock resource_lock(resources->mutex);
+    auto& execution = prepare_locked(session, *resources);
 
-    if (execution.running) {
+    if (resources->lifecycle_phase == LifecyclePhase::Stopping) {
+        throw runtime_error(session, "start", "session runtime teardown is still in progress");
+    }
+    if (execution.running && resources->lifecycle_phase == LifecyclePhase::Running) {
         return;
     }
 
-    if (execution.worker.joinable()) {
-        execution.worker.join();
-    }
+    join_worker_if_needed(*resources, resource_lock);
 
-    execution.async_error.reset();
+    resources->async_error.reset();
+    resources->teardown_error.reset();
+    resources->teardown_complete = false;
+    resources->lifecycle_phase = LifecyclePhase::Starting;
     execution.running = true;
-    execution.worker = std::thread([&execution]() {
+    execution.worker_finished = false;
+    const auto generation = resources->generation;
+    execution.worker = std::thread([resources, generation]() {
+        std::optional<std::string> async_error;
         try {
-            const auto result = execution.scheduler->runAndWait();
+            const auto result = resources->execution->scheduler->runAndWait();
             if (!result.has_value()) {
-                std::lock_guard execution_lock(execution.mutex);
-                execution.async_error = std::format("scheduler execution failed: {}", result.error());
+                async_error = std::format("scheduler execution failed: {}", result.error());
             }
         } catch (const std::exception& error) {
-            std::lock_guard execution_lock(execution.mutex);
-            execution.async_error = std::string(error.what());
+            async_error = std::string(error.what());
         } catch (...) {
-            std::lock_guard execution_lock(execution.mutex);
-            execution.async_error = "unknown scheduler execution failure";
+            async_error = "unknown scheduler execution failure";
         }
 
-        std::lock_guard execution_lock(execution.mutex);
-        execution.running = false;
+        std::lock_guard completion_lock(resources->mutex);
+        if (resources->generation == generation && resources->execution) {
+            resources->execution->running = false;
+            resources->execution->worker_finished = true;
+            resources->async_error = async_error;
+            if (resources->lifecycle_phase == LifecyclePhase::Starting) {
+                resources->lifecycle_phase = async_error.has_value() ? LifecyclePhase::Failed : LifecyclePhase::Running;
+                resources->teardown_complete = !async_error.has_value();
+                resources->teardown_error = async_error;
+            }
+        }
+        resources->condition.notify_all();
     });
+    resources->lifecycle_phase = LifecyclePhase::Running;
 }
 
 void Gr4RuntimeManager::stop(const domain::Session& session) {
-    std::lock_guard lock(mutex_);
-    auto* execution = find_execution_locked(session.id);
-    if (execution == nullptr) {
+    auto resources = find_resources(session.id);
+    if (!resources) {
         return;
     }
-    stop_locked(session, *execution);
+
+    std::unique_lock resource_lock(resources->mutex);
+    stop_locked(session, *resources, resource_lock);
 }
 
 void Gr4RuntimeManager::destroy(const domain::Session& session) {
-    std::lock_guard lock(mutex_);
-    destroy_locked(session);
+    auto resources = find_resources(session.id);
+    if (!resources) {
+        return;
+    }
+
+    {
+        std::unique_lock resource_lock(resources->mutex);
+        stop_locked(session, *resources, resource_lock);
+        resources->execution.reset();
+        release_stream_bindings_locked(*resources);
+        resources->lifecycle_phase = LifecyclePhase::Idle;
+        resources->teardown_complete = true;
+        resources->teardown_error.reset();
+    }
+
+    std::lock_guard lock(resources_mutex_);
+    const auto it = resources_.find(session.id);
+    if (it != resources_.end() && it->second == resources) {
+        resources_.erase(it);
+    }
+}
+
+std::optional<domain::StreamRuntimePlan> Gr4RuntimeManager::active_stream_plan(const domain::Session& session) {
+    auto resources = find_resources(session.id);
+    if (!resources) {
+        return std::nullopt;
+    }
+
+    std::lock_guard resource_lock(resources->mutex);
+    const auto* execution = resources->execution.get();
+    if (execution == nullptr || !execution->running || resources->lifecycle_phase != LifecyclePhase::Running ||
+        resources->stream_bindings.empty()) {
+        return std::nullopt;
+    }
+
+    domain::StreamRuntimePlan plan;
+    for (const auto& binding : resources->stream_bindings) {
+        plan.streams.push_back(binding.plan);
+    }
+    return plan;
+}
+
+HttpStreamResponse Gr4RuntimeManager::fetch_http_stream(const domain::Session& session, const std::string& stream_id) {
+    domain::InternalStreamBinding internal;
+    {
+        auto resources = find_resources(session.id);
+        if (!resources) {
+            throw runtime_error(session, "stream fetch", "session runtime is not running");
+        }
+
+        std::lock_guard resource_lock(resources->mutex);
+        const auto* execution = resources->execution.get();
+        if (execution == nullptr || !execution->running || resources->lifecycle_phase != LifecyclePhase::Running) {
+            throw runtime_error(session, "stream fetch", "session runtime is not running");
+        }
+
+        const auto binding_it = std::ranges::find_if(resources->stream_bindings, [&](const auto& binding) {
+            return binding.plan.stream_id == stream_id && binding.plan.transport != "websocket";
+        });
+        if (binding_it == resources->stream_bindings.end()) {
+            throw runtime_error(session, "stream fetch", "stream not found in active runtime resources: " + stream_id);
+        }
+        internal = binding_it->internal;
+    }
+
+    stream_debug(std::format("session={} stream_id={} fetch_target={}", session.id, stream_id, internal.endpoint));
+
+    httplib::Client client(internal.host, internal.port);
+    client.set_connection_timeout(1, 0);
+    client.set_read_timeout(2, 0);
+    const auto response = client.Get(internal.path.c_str());
+    if (!response) {
+        stream_debug(std::format("session={} stream_id={} fetch_failed target={} error={}",
+                                 session.id,
+                                 stream_id,
+                                 internal.endpoint,
+                                 static_cast<int>(response.error())));
+        throw runtime_error(session, "stream fetch", "failed to reach internal HTTP stream endpoint");
+    }
+
+    stream_debug(std::format("session={} stream_id={} fetch_status={} target={}",
+                             session.id,
+                             stream_id,
+                             response->status,
+                             internal.endpoint));
+
+    auto content_type = response->get_header_value("Content-Type");
+    if (content_type.empty()) {
+        content_type = "application/octet-stream";
+    }
+    return HttpStreamResponse{
+        .status = response->status,
+        .body = response->body,
+        .content_type = content_type,
+    };
+}
+
+WebSocketStreamRoute Gr4RuntimeManager::resolve_websocket_stream(const domain::Session& session, const std::string& stream_id) {
+    auto resources = find_resources(session.id);
+    if (!resources) {
+        throw runtime_error(session, "websocket route", "session runtime is not running");
+    }
+
+    std::lock_guard resource_lock(resources->mutex);
+    const auto* execution = resources->execution.get();
+    if (execution == nullptr || !execution->running || resources->lifecycle_phase != LifecyclePhase::Running) {
+        throw runtime_error(session, "websocket route", "session runtime is not running");
+    }
+
+    const auto binding_it = std::ranges::find_if(resources->stream_bindings, [&](const auto& binding) {
+        return binding.plan.stream_id == stream_id && binding.plan.transport == "websocket";
+    });
+    if (binding_it == resources->stream_bindings.end()) {
+        throw runtime_error(session, "websocket route", "stream not found in active runtime resources: " + stream_id);
+    }
+
+    return WebSocketStreamRoute{.internal = binding_it->internal};
 }
 
 void Gr4RuntimeManager::set_block_settings(const domain::Session& session,
                                            const std::string& block_target,
                                            const gr::property_map& patch,
                                            BlockSettingsMode mode) {
-    std::lock_guard lock(mutex_);
-    auto* execution = find_execution_locked(session.id);
-    if (execution == nullptr || !execution->running) {
+    auto resources = find_resources(session.id);
+    if (!resources) {
+        throw runtime_error(session, "settings update", "session runtime is not running");
+    }
+    std::lock_guard resource_lock(resources->mutex);
+    auto* execution = resources->execution.get();
+    if (execution == nullptr || !execution->running || resources->lifecycle_phase != LifecyclePhase::Running) {
         throw runtime_error(session, "settings update", "session runtime is not running");
     }
 
@@ -682,9 +922,13 @@ void Gr4RuntimeManager::set_block_settings(const domain::Session& session,
 }
 
 gr::property_map Gr4RuntimeManager::get_block_settings(const domain::Session& session, const std::string& block_target) {
-    std::lock_guard lock(mutex_);
-    auto* execution = find_execution_locked(session.id);
-    if (execution == nullptr || !execution->running) {
+    auto resources = find_resources(session.id);
+    if (!resources) {
+        throw runtime_error(session, "settings read", "session runtime is not running");
+    }
+    std::lock_guard resource_lock(resources->mutex);
+    auto* execution = resources->execution.get();
+    if (execution == nullptr || !execution->running || resources->lifecycle_phase != LifecyclePhase::Running) {
         throw runtime_error(session, "settings read", "session runtime is not running");
     }
 
@@ -711,68 +955,165 @@ gr::property_map Gr4RuntimeManager::get_block_settings(const domain::Session& se
     }
 }
 
-Gr4RuntimeManager::Execution& Gr4RuntimeManager::prepare_locked(const domain::Session& session) {
-    if (auto* existing = find_execution_locked(session.id); existing != nullptr) {
-        return *existing;
+std::shared_ptr<Gr4RuntimeManager::SessionRuntimeResources> Gr4RuntimeManager::get_or_create_resources(const domain::Session& session) {
+    std::lock_guard lock(resources_mutex_);
+    auto& resource = resources_[session.id];
+    if (!resource) {
+        resource = std::make_shared<SessionRuntimeResources>();
+        resource->session_id = session.id;
+    }
+    return resource;
+}
+
+std::shared_ptr<Gr4RuntimeManager::SessionRuntimeResources> Gr4RuntimeManager::find_resources(const std::string& session_id) {
+    std::lock_guard lock(resources_mutex_);
+    const auto it = resources_.find(session_id);
+    return it == resources_.end() ? nullptr : it->second;
+}
+
+Gr4RuntimeManager::Execution& Gr4RuntimeManager::prepare_locked(const domain::Session& session,
+                                                               SessionRuntimeResources& resources) {
+    if (resources.lifecycle_phase == LifecyclePhase::Stopping) {
+        throw runtime_error(session, "prepare", "session runtime teardown is still in progress");
+    }
+    if (resources.execution) {
+        return *resources.execution;
+    }
+
+    if (const auto contract_error = domain::validate_stream_runtime_contract(session); contract_error.has_value()) {
+        throw runtime_error(session, "prepare", *contract_error);
     }
 
     ensure_runtime_environment(plugin_directories_);
 
+    release_stream_bindings_locked(resources);
+    std::vector<domain::RuntimeStreamBinding> stream_bindings;
+    if (const auto plan = domain::derive_stream_runtime_plan(session); plan.has_value()) {
+        stream_bindings.reserve(plan->streams.size());
+        for (auto stream_plan : plan->streams) {
+            auto internal = stream_plan.transport == "websocket" ? stream_allocator_.allocate_websocket()
+                                                                  : stream_allocator_.allocate_http();
+            stream_plan.ready = true;
+            stream_debug(std::format("session={} stream_id={} transport={} injected_endpoint={} browser_path={}",
+                                     session.id,
+                                     stream_plan.stream_id,
+                                     stream_plan.transport,
+                                     internal.endpoint,
+                                     stream_plan.path));
+            stream_bindings.push_back(domain::RuntimeStreamBinding{
+                .plan = stream_plan,
+                .internal = internal,
+                .browser = domain::to_browser_stream_descriptor(stream_plan),
+            });
+        }
+    }
+
     auto execution = std::make_unique<Execution>();
     try {
-        auto graph = gr::loadGrc(gr::globalPluginLoader(), normalize_graph_content(session.grc_content));
+        auto graph = gr::loadGrc(gr::globalPluginLoader(), normalize_graph_content(session.grc_content, stream_bindings));
         execution->scheduler = std::make_unique<gr::scheduler::Simple<>>();
         const auto exchanged = execution->scheduler->exchange(std::move(graph));
         if (!exchanged.has_value()) {
             throw runtime_error(session, "prepare", std::format("failed to initialize scheduler: {}", exchanged.error()));
         }
     } catch (const std::exception& error) {
+        for (const auto& binding : stream_bindings) {
+            stream_allocator_.release(binding.internal);
+        }
         throw runtime_error(session, "prepare", error.what());
     }
 
-    auto [it, inserted] = executions_.emplace(session.id, std::move(execution));
-    return *it->second;
+    resources.execution = std::move(execution);
+    resources.stream_bindings = std::move(stream_bindings);
+    resources.generation += 1;
+    resources.lifecycle_phase = LifecyclePhase::Idle;
+    resources.teardown_complete = true;
+    resources.teardown_error.reset();
+    return *resources.execution;
 }
 
-Gr4RuntimeManager::Execution* Gr4RuntimeManager::find_execution_locked(const std::string& session_id) {
-    const auto it = executions_.find(session_id);
-    return it == executions_.end() ? nullptr : it->second.get();
+void Gr4RuntimeManager::release_stream_bindings_locked(SessionRuntimeResources& resources) {
+    for (const auto& binding : resources.stream_bindings) {
+        stream_allocator_.release(binding.internal);
+    }
+    resources.stream_bindings.clear();
 }
 
-void Gr4RuntimeManager::stop_locked(const domain::Session& session, Execution& execution) {
-    if (execution.running) {
-        const auto result = execution.scheduler->changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
+void Gr4RuntimeManager::stop_locked(const domain::Session& session,
+                                    SessionRuntimeResources& resources,
+                                    std::unique_lock<std::mutex>& lock) {
+    static constexpr auto kStopTimeout = std::chrono::seconds(2);
+
+    auto* execution = resources.execution.get();
+    if (execution == nullptr) {
+        release_stream_bindings_locked(resources);
+        resources.lifecycle_phase = LifecyclePhase::Idle;
+        resources.teardown_complete = true;
+        resources.teardown_error.reset();
+        return;
+    }
+
+    if (resources.lifecycle_phase == LifecyclePhase::Stopping) {
+        throw runtime_error(session, "stop", "session runtime stop already in progress");
+    }
+
+    resources.lifecycle_phase = LifecyclePhase::Stopping;
+    resources.teardown_complete = false;
+    resources.teardown_error.reset();
+
+    if (execution->running) {
+        const auto result = execution->scheduler->changeStateTo(gr::lifecycle::State::REQUESTED_STOP);
         if (!result.has_value()) {
+            resources.lifecycle_phase = LifecyclePhase::Failed;
+            resources.teardown_error = std::format("failed to stop scheduler: {}", result.error());
             throw runtime_error(session, "stop", std::format("failed to stop scheduler: {}", result.error()));
         }
     }
 
-    if (execution.worker.joinable()) {
-        execution.worker.join();
+    if (execution->worker.joinable() && !execution->worker_finished) {
+        const auto completed =
+            resources.condition.wait_for(lock,
+                                         kStopTimeout,
+                                         [&resources]() {
+                                             return resources.execution == nullptr || resources.execution->worker_finished;
+                                         });
+        if (!completed) {
+            const auto message = std::format("teardown timed out after {} ms", kStopTimeout.count() * 1000);
+            resources.lifecycle_phase = LifecyclePhase::Failed;
+            resources.teardown_error = message;
+            throw runtime_error(session, "stop", message);
+        }
+        join_worker_if_needed(resources, lock);
+    } else {
+        join_worker_if_needed(resources, lock);
     }
 
-    std::lock_guard execution_lock(execution.mutex);
-    execution.running = false;
-    if (execution.async_error.has_value()) {
-        throw runtime_error(session, "execution", *execution.async_error);
+    execution = resources.execution.get();
+    if (execution) {
+        execution->running = false;
+        execution->worker_finished = true;
     }
+    release_stream_bindings_locked(resources);
+    resources.execution.reset();
+    resources.teardown_complete = true;
+    if (resources.async_error.has_value()) {
+        resources.lifecycle_phase = LifecyclePhase::Failed;
+        resources.teardown_error = resources.async_error;
+        throw runtime_error(session, "execution", *resources.async_error);
+    }
+    resources.lifecycle_phase = LifecyclePhase::Idle;
+    resources.teardown_error.reset();
 }
 
-void Gr4RuntimeManager::destroy_locked(const domain::Session& session) {
-    auto it = executions_.find(session.id);
-    if (it == executions_.end()) {
+void Gr4RuntimeManager::join_worker_if_needed(SessionRuntimeResources& resources, std::unique_lock<std::mutex>& lock) {
+    if (!resources.execution || !resources.execution->worker.joinable() || !resources.execution->worker_finished) {
         return;
     }
 
-    auto execution = std::move(it->second);
-    executions_.erase(it);
-    if (!execution) {
-        return;
-    }
-
-    stop_locked(session, *execution);
-    static auto* retired = new std::vector<std::unique_ptr<Execution>>();
-    retired->push_back(std::move(execution));
+    auto worker = std::move(resources.execution->worker);
+    lock.unlock();
+    worker.join();
+    lock.lock();
 }
 
 }  // namespace gr4cp::runtime

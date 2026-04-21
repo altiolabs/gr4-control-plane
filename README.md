@@ -136,6 +136,26 @@ curl -X POST http://127.0.0.1:8080/sessions/<id>/stop
 curl -X POST http://127.0.0.1:8080/sessions/<id>/restart
 ```
 
+### Current Managed Stream Scope
+
+The current `streams[]`/managed-route slice is driven by authored stream-export metadata on blocks rather than block-family-specific planner rules.
+
+Authored stream metadata may be expressed as either:
+
+- preferred nested form under `parameters.stream`
+- compatibility flattened fields such as `transport` plus `payload_format`
+
+Current managed transport values are `http_snapshot`, `http_poll`, and `websocket`.
+
+Behavior notes:
+
+- `streams[]` is emitted only for running sessions
+- authored stream metadata is the persisted managed-stream intent the runtime uses
+- authored `endpoint` may still exist in stored graph content, but the managed runtime path ignores it whenever a managed stream descriptor is derived
+- runtime-owned bindings plus session-scoped browser-facing routes define the active-session stream path
+- blocks without valid stream-export metadata remain on the legacy no-`streams[]` path
+- a managed stream with an invalid/unsupported transport fails explicitly on start/restart instead of silently degrading to legacy fallback
+
 ### Delete A Session
 
 ```bash
