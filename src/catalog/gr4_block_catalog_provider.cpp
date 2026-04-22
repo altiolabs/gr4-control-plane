@@ -1246,9 +1246,9 @@ std::vector<domain::BlockDescriptor> Gr4BlockCatalogProvider::list() const {
     const auto candidate_libraries = collect_candidate_libraries(plugin_directories_);
     bootstrap_blocklib_symbols(candidate_libraries.staged_shared_libraries);
 
-    std::vector<std::filesystem::path> plugin_loader_directories;
+    std::vector<std::string> plugin_loader_directories;
     if (!candidate_libraries.staged_plugin_libraries.empty()) {
-        plugin_loader_directories.push_back(candidate_libraries.plugin_staging_directory);
+        plugin_loader_directories.push_back(candidate_libraries.plugin_staging_directory.string());
     }
     auto plugin_loader = std::make_unique<gr::PluginLoader>(gr::globalBlockRegistry(), gr::globalSchedulerRegistry(),
                                                             plugin_loader_directories);
