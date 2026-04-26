@@ -949,6 +949,19 @@ TEST_F(HttpApiTest, GetBlocksSuccess) {
     EXPECT_TRUE(body[0]["parameters"].is_array());
 }
 
+TEST_F(HttpApiTest, GetBlocksDoesNotAdvertiseCompressedBodyAfterProxyDecompression) {
+    const httplib::Headers headers{{"Accept-Encoding", "br, gzip, deflate"}};
+    const auto response = client->Get("/blocks", headers);
+
+    ASSERT_TRUE(response);
+    EXPECT_EQ(response->status, 200);
+    expect_json_content_type(response);
+    EXPECT_FALSE(response->has_header("Content-Encoding"));
+
+    const auto body = parse_json(response);
+    ASSERT_EQ(body.size(), 5U);
+}
+
 TEST_F(HttpApiTest, GetBlocksUsesDeterministicOrdering) {
     const auto response = client->Get("/blocks");
 

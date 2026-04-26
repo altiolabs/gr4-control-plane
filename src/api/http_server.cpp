@@ -515,7 +515,9 @@ httplib::Headers to_httplib_headers(const http::fields& fields) {
     httplib::Headers headers;
     for (const auto& field : fields) {
         const auto name = std::string(field.name_string());
-        if (name == "Host" || name == "Connection" || name == "Upgrade" || name == "Content-Length") {
+        const auto header = field.name();
+        if (header == http::field::host || header == http::field::connection || header == http::field::upgrade ||
+            header == http::field::content_length || header == http::field::accept_encoding) {
             continue;
         }
         headers.emplace(name, std::string(field.value()));
