@@ -43,6 +43,13 @@ find_package(GTest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 set(Boost_NO_BOOST_CMAKE ON)
 find_package(Boost REQUIRED)
+if(TARGET Boost::headers)
+    set(GR4CP_BOOST_HEADERS_TARGET Boost::headers)
+elseif(TARGET Boost::boost)
+    set(GR4CP_BOOST_HEADERS_TARGET Boost::boost)
+else()
+    message(FATAL_ERROR "Boost headers target was not provided by find_package(Boost)")
+endif()
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(CPPHTTPLIB REQUIRED IMPORTED_TARGET cpp-httplib)
@@ -159,7 +166,7 @@ target_include_directories(gr4cp_core
 
 target_link_libraries(gr4cp_core
     PUBLIC
-        Boost::boost
+        ${GR4CP_BOOST_HEADERS_TARGET}
         ${GR4CP_HTTPLIB_TARGET}
         PkgConfig::CPPHTTPLIB_OPENSSL
         PkgConfig::CPPHTTPLIB_BROTLICOMMON
@@ -187,7 +194,7 @@ target_include_directories(gr4cp_cli
 
 target_link_libraries(gr4cp_cli
     PUBLIC
-        Boost::boost
+        ${GR4CP_BOOST_HEADERS_TARGET}
         ${GR4CP_HTTPLIB_TARGET}
         PkgConfig::CPPHTTPLIB_OPENSSL
         PkgConfig::CPPHTTPLIB_BROTLICOMMON
