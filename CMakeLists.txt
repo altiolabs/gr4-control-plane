@@ -52,31 +52,39 @@ else()
 endif()
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(CPPHTTPLIB REQUIRED IMPORTED_TARGET cpp-httplib)
-pkg_check_modules(CPPHTTPLIB_OPENSSL REQUIRED IMPORTED_TARGET openssl)
-pkg_check_modules(CPPHTTPLIB_BROTLICOMMON REQUIRED IMPORTED_TARGET libbrotlicommon)
-pkg_check_modules(CPPHTTPLIB_BROTLIDEC REQUIRED IMPORTED_TARGET libbrotlidec)
-pkg_check_modules(CPPHTTPLIB_BROTLIENC REQUIRED IMPORTED_TARGET libbrotlienc)
-
 find_package(httplib CONFIG QUIET)
-if(TARGET PkgConfig::CPPHTTPLIB)
-    set(GR4CP_HTTPLIB_TARGET PkgConfig::CPPHTTPLIB)
-elseif(httplib_FOUND)
+set(GR4CP_HTTPLIB_EXTRA_TARGETS "")
+if(httplib_FOUND)
     set(GR4CP_HTTPLIB_TARGET httplib::httplib)
 else()
-    find_path(GR4CP_CPPHTTPLIB_INCLUDE_DIR
-        NAMES httplib.h
-        PATH_SUFFIXES include
-    )
+    pkg_check_modules(CPPHTTPLIB QUIET IMPORTED_TARGET cpp-httplib)
+    if(TARGET PkgConfig::CPPHTTPLIB)
+        set(GR4CP_HTTPLIB_TARGET PkgConfig::CPPHTTPLIB)
+        pkg_check_modules(CPPHTTPLIB_OPENSSL REQUIRED IMPORTED_TARGET openssl)
+        pkg_check_modules(CPPHTTPLIB_BROTLICOMMON REQUIRED IMPORTED_TARGET libbrotlicommon)
+        pkg_check_modules(CPPHTTPLIB_BROTLIDEC REQUIRED IMPORTED_TARGET libbrotlidec)
+        pkg_check_modules(CPPHTTPLIB_BROTLIENC REQUIRED IMPORTED_TARGET libbrotlienc)
+        list(APPEND GR4CP_HTTPLIB_EXTRA_TARGETS
+            PkgConfig::CPPHTTPLIB_OPENSSL
+            PkgConfig::CPPHTTPLIB_BROTLICOMMON
+            PkgConfig::CPPHTTPLIB_BROTLIDEC
+            PkgConfig::CPPHTTPLIB_BROTLIENC
+        )
+    else()
+        find_path(GR4CP_CPPHTTPLIB_INCLUDE_DIR
+            NAMES httplib.h
+            PATH_SUFFIXES include
+        )
 
-    if(NOT GR4CP_CPPHTTPLIB_INCLUDE_DIR)
-        message(FATAL_ERROR "Could not find cpp-httplib. Install it with a CMake package config or ensure httplib.h is visible to CMake.")
+        if(NOT GR4CP_CPPHTTPLIB_INCLUDE_DIR)
+            message(FATAL_ERROR "Could not find cpp-httplib. Install it with a CMake package config, a pkg-config module, or ensure httplib.h is visible to CMake.")
+        endif()
+
+        add_library(gr4cp_cpp_httplib INTERFACE)
+        add_library(gr4cp::cpp_httplib ALIAS gr4cp_cpp_httplib)
+        target_include_directories(gr4cp_cpp_httplib INTERFACE "${GR4CP_CPPHTTPLIB_INCLUDE_DIR}")
+        set(GR4CP_HTTPLIB_TARGET gr4cp::cpp_httplib)
     endif()
-
-    add_library(gr4cp_cpp_httplib INTERFACE)
-    add_library(gr4cp::cpp_httplib ALIAS gr4cp_cpp_httplib)
-    target_include_directories(gr4cp_cpp_httplib INTERFACE "${GR4CP_CPPHTTPLIB_INCLUDE_DIR}")
-    set(GR4CP_HTTPLIB_TARGET gr4cp::cpp_httplib)
 endif()
 
 function(gr4cp_remove_imported_werror target_name)
@@ -168,10 +176,7 @@ target_link_libraries(gr4cp_core
     PUBLIC
         ${GR4CP_BOOST_HEADERS_TARGET}
         ${GR4CP_HTTPLIB_TARGET}
-        PkgConfig::CPPHTTPLIB_OPENSSL
-        PkgConfig::CPPHTTPLIB_BROTLICOMMON
-        PkgConfig::CPPHTTPLIB_BROTLIDEC
-        PkgConfig::CPPHTTPLIB_BROTLIENC
+        ${GR4CP_HTTPLIB_EXTRA_TARGETS}
         ZLIB::ZLIB
         nlohmann_json::nlohmann_json
 )
@@ -196,10 +201,7 @@ target_link_libraries(gr4cp_cli
     PUBLIC
         ${GR4CP_BOOST_HEADERS_TARGET}
         ${GR4CP_HTTPLIB_TARGET}
-        PkgConfig::CPPHTTPLIB_OPENSSL
-        PkgConfig::CPPHTTPLIB_BROTLICOMMON
-        PkgConfig::CPPHTTPLIB_BROTLIDEC
-        PkgConfig::CPPHTTPLIB_BROTLIENC
+        ${GR4CP_HTTPLIB_EXTRA_TARGETS}
         ZLIB::ZLIB
         nlohmann_json::nlohmann_json
 )
