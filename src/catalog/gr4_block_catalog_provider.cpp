@@ -455,10 +455,10 @@ std::string parameter_type_name(const gr::pmt::Value& value) {
         case ValueType::UInt16:
         case ValueType::UInt32:
         case ValueType::UInt64: return "int_vector";
-        case ValueType::Float32:
-        case ValueType::Float64: return "float_vector";
-        case ValueType::ComplexFloat32:
-        case ValueType::ComplexFloat64: return "complex_vector";
+        case ValueType::Float32: return "float32_vector";
+        case ValueType::Float64: return "float64_vector";
+        case ValueType::ComplexFloat32: return "complex_float32_vector";
+        case ValueType::ComplexFloat64: return "complex_float64_vector";
         case ValueType::String: return "string_vector";
         case ValueType::Value: return "value_vector";
         case ValueType::Monostate: return "vector";
