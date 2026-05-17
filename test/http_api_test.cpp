@@ -26,6 +26,7 @@
 #include "gr4cp/app/session_service.hpp"
 #include "gr4cp/app/session_stream_service.hpp"
 #include "gr4cp/catalog/block_catalog_provider.hpp"
+#include "gr4cp/catalog/scheduler_catalog_provider.hpp"
 #include "gr4cp/runtime/gr4_runtime_manager.hpp"
 #include "gr4cp/runtime/runtime_manager.hpp"
 #include "gr4cp/runtime/stream_binding_allocator.hpp"
@@ -129,6 +130,17 @@ public:
                 .outputs = {{"out", "float"}},
                 .parameters = {},
             },
+        };
+    }
+};
+
+class TestSchedulerCatalogProvider final : public gr4cp::catalog::SchedulerCatalogProvider {
+public:
+    std::vector<gr4cp::domain::SchedulerDescriptor> list() const override {
+        return {
+            gr4cp::domain::SchedulerDescriptor{"gr::scheduler::SimpleSingle"},
+            gr4cp::domain::SchedulerDescriptor{"gr::scheduler::SimpleMulti"},
+            gr4cp::domain::SchedulerDescriptor{"gr::incubator::scheduler::BlockingBackoff"},
         };
     }
 };
@@ -693,6 +705,7 @@ protected:
         server = std::make_unique<gr4cp::api::HttpServer>(service,
                                                           session_stream_service,
                                                           block_catalog_service,
+                                                          scheduler_catalog_service,
                                                           block_settings_service);
         port = server->bind_to_any_port("127.0.0.1");
         ASSERT_GT(port, 0);
@@ -779,10 +792,12 @@ protected:
     gr4cp::storage::InMemorySessionRepository repository;
     FakeRuntimeManager runtime_manager;
     TestBlockCatalogProvider block_catalog_provider;
+    TestSchedulerCatalogProvider scheduler_catalog_provider;
     gr4cp::app::SessionService service{repository, runtime_manager};
     gr4cp::app::SessionStreamService session_stream_service;
     gr4cp::app::BlockSettingsService block_settings_service{repository, runtime_manager};
     gr4cp::app::BlockCatalogService block_catalog_service{block_catalog_provider};
+    gr4cp::app::SchedulerCatalogService scheduler_catalog_service{scheduler_catalog_provider};
     int port{};
     std::jthread server_thread;
     std::unique_ptr<httplib::Client> client;
@@ -820,6 +835,7 @@ protected:
         server = std::make_unique<gr4cp::api::HttpServer>(service,
                                                           session_stream_service,
                                                           block_catalog_service,
+                                                          scheduler_catalog_service,
                                                           block_settings_service);
         port = server->bind_to_any_port("127.0.0.1");
         ASSERT_GT(port, 0);
@@ -855,10 +871,12 @@ protected:
     gr4cp::storage::InMemorySessionRepository repository;
     gr4cp::runtime::Gr4RuntimeManager runtime_manager;
     TestBlockCatalogProvider block_catalog_provider;
+    TestSchedulerCatalogProvider scheduler_catalog_provider;
     gr4cp::app::SessionService service{repository, runtime_manager};
     gr4cp::app::SessionStreamService session_stream_service;
     gr4cp::app::BlockSettingsService block_settings_service{repository, runtime_manager};
     gr4cp::app::BlockCatalogService block_catalog_service{block_catalog_provider};
+    gr4cp::app::SchedulerCatalogService scheduler_catalog_service{scheduler_catalog_provider};
     int port{};
     std::jthread server_thread;
     std::unique_ptr<httplib::Client> client;
