@@ -133,10 +133,12 @@ endif()
 add_library(gr4cp_core
     src/app/block_settings_service.cpp
     src/app/block_catalog_service.cpp
+    src/app/scheduler_catalog_service.cpp
     src/app/session_stream_service.cpp
     src/api/http_server.cpp
     src/catalog/static_block_catalog_provider.cpp
     src/domain/block_catalog.cpp
+    src/domain/scheduler_catalog.cpp
     src/domain/session.cpp
     src/domain/session_stream.cpp
     src/app/session_service.cpp
@@ -150,16 +152,23 @@ if(GR4CP_HAVE_GNURADIO4)
     target_sources(gr4cp_core
         PRIVATE
             src/catalog/gr4_block_catalog_provider.cpp
+            src/catalog/gr4_scheduler_catalog_provider.cpp
     )
     target_compile_definitions(gr4cp_core
         PUBLIC
             GR4CP_HAVE_GNURADIO4
             GR4CP_DEFAULT_GNURADIO4_PLUGIN_DIR="${GR4CP_GNURADIO4_LIB_DIR}"
     )
+    set(GR4CP_GNURADIO4_TARGETS
+        gnuradio4::gnuradio-core
+        gnuradio4::gnuradio-blocklib-core
+    )
+    if(TARGET gnuradio4::gnuradio-plugin)
+        list(APPEND GR4CP_GNURADIO4_TARGETS gnuradio4::gnuradio-plugin)
+    endif()
     target_link_libraries(gr4cp_core
         PUBLIC
-            gnuradio4::gnuradio-core
-            gnuradio4::gnuradio-blocklib-core
+            ${GR4CP_GNURADIO4_TARGETS}
     )
     set(_gr4cp_test_env
         "GNURADIO4_PLUGIN_DIRECTORIES=${GR4CP_GNURADIO4_LIB_DIR}"

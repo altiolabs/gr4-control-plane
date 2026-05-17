@@ -63,7 +63,9 @@ SessionService::InternalLifecyclePhase SessionService::phase_for_locked(const do
     return InternalLifecyclePhase::Failed;
 }
 
-domain::Session SessionService::create(const std::string& name, const std::string& grc) {
+domain::Session SessionService::create(const std::string& name,
+                                       const std::string& grc,
+                                       std::optional<std::string> scheduler_alias) {
     std::lock_guard lock(mutex_);
 
     if (grc.empty()) {
@@ -73,6 +75,7 @@ domain::Session SessionService::create(const std::string& name, const std::strin
     auto session = domain::Session{};
     session.name = name;
     session.grc_content = grc;
+    session.scheduler_alias = std::move(scheduler_alias);
     session.state = domain::SessionState::Stopped;
 
     do {

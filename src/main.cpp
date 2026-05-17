@@ -1,9 +1,11 @@
 #include "gr4cp/app/block_catalog_service.hpp"
 #include "gr4cp/app/block_settings_service.hpp"
+#include "gr4cp/app/scheduler_catalog_service.hpp"
 #include "gr4cp/app/session_service.hpp"
 #include "gr4cp/app/session_stream_service.hpp"
 #include "gr4cp/api/http_server.hpp"
 #include "gr4cp/catalog/gr4_block_catalog_provider.hpp"
+#include "gr4cp/catalog/gr4_scheduler_catalog_provider.hpp"
 #include "gr4cp/runtime/gr4_runtime_manager.hpp"
 #include "gr4cp/storage/in_memory_session_repository.hpp"
 
@@ -26,18 +28,26 @@ int main() {
     gr4cp::app::BlockSettingsService block_settings_service(repository, runtime_manager);
     gr4cp::catalog::Gr4BlockCatalogProvider block_catalog_provider;
     gr4cp::app::BlockCatalogService block_catalog_service(block_catalog_provider);
+    gr4cp::catalog::Gr4SchedulerCatalogProvider scheduler_catalog_provider;
+    gr4cp::app::SchedulerCatalogService scheduler_catalog_service(scheduler_catalog_provider);
 
     try {
         (void)block_catalog_service.list();
+        (void)scheduler_catalog_service.list();
         std::cout << "Using GNU Radio 4-backed block catalog\n";
+        std::cout << "Using GNU Radio 4-backed scheduler catalog\n";
     } catch (const gr4cp::catalog::CatalogLoadError& error) {
         std::cerr << "GNU Radio 4 catalog initialization failed: " << error.what() << '\n';
+        return 1;
+    } catch (const gr4cp::catalog::SchedulerCatalogLoadError& error) {
+        std::cerr << "GNU Radio 4 scheduler catalog initialization failed: " << error.what() << '\n';
         return 1;
     }
 
     gr4cp::api::HttpServer server(session_service,
                                   session_stream_service,
                                   block_catalog_service,
+                                  scheduler_catalog_service,
                                   block_settings_service);
 
     const char* port_env = std::getenv("GR4CP_PORT");

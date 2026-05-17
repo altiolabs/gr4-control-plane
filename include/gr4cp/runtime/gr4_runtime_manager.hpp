@@ -3,7 +3,6 @@
 #include "gr4cp/runtime/runtime_manager.hpp"
 #include "gr4cp/runtime/stream_binding_allocator.hpp"
 
-#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -53,7 +52,6 @@ private:
     void stop_locked(const domain::Session& session,
                      SessionRuntimeResources& resources,
                      std::unique_lock<std::mutex>& lock);
-    void join_worker_if_needed(SessionRuntimeResources& resources, std::unique_lock<std::mutex>& lock);
 
     std::vector<std::filesystem::path> plugin_directories_;
     StreamBindingAllocator stream_allocator_;

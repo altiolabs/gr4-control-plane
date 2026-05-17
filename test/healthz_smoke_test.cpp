@@ -13,6 +13,7 @@
 #include "gr4cp/app/session_service.hpp"
 #include "gr4cp/app/session_stream_service.hpp"
 #include "gr4cp/catalog/block_catalog_provider.hpp"
+#include "gr4cp/catalog/scheduler_catalog_provider.hpp"
 #include "gr4cp/runtime/stub_runtime_manager.hpp"
 #include "gr4cp/storage/in_memory_session_repository.hpp"
 
@@ -23,18 +24,26 @@ public:
     std::vector<gr4cp::domain::BlockDescriptor> list() const override { return {}; }
 };
 
+class EmptySchedulerCatalogProvider final : public gr4cp::catalog::SchedulerCatalogProvider {
+public:
+    std::vector<gr4cp::domain::SchedulerDescriptor> list() const override { return {}; }
+};
+
 TEST(HealthzSmokeTest, ReturnsOkJson) {
     gr4cp::storage::InMemorySessionRepository repository;
     gr4cp::runtime::StubRuntimeManager runtime_manager;
     EmptyBlockCatalogProvider block_catalog_provider;
+    EmptySchedulerCatalogProvider scheduler_catalog_provider;
     gr4cp::app::SessionService session_service(repository, runtime_manager);
     gr4cp::app::SessionStreamService session_stream_service;
     gr4cp::app::BlockSettingsService block_settings_service(repository, runtime_manager);
     gr4cp::app::BlockCatalogService block_catalog_service(block_catalog_provider);
+    gr4cp::app::SchedulerCatalogService scheduler_catalog_service(scheduler_catalog_provider);
 
     gr4cp::api::HttpServer server(session_service,
                                   session_stream_service,
                                   block_catalog_service,
+                                  scheduler_catalog_service,
                                   block_settings_service);
 
     const auto port = server.bind_to_any_port("127.0.0.1");

@@ -157,6 +157,18 @@ Json blocks_to_json(const std::vector<domain::BlockDescriptor>& blocks) {
     return body;
 }
 
+Json scheduler_to_json(const domain::SchedulerDescriptor& scheduler) {
+    return Json{{"id", scheduler.id}};
+}
+
+Json schedulers_to_json(const std::vector<domain::SchedulerDescriptor>& schedulers) {
+    auto body = Json::array();
+    for (const auto& scheduler : schedulers) {
+        body.push_back(scheduler_to_json(scheduler));
+    }
+    return body;
+}
+
 Json session_to_json(const domain::Session& session, const std::optional<domain::StreamRuntimePlan>& stream_plan = std::nullopt) {
     auto body = Json{
         {"id", session.id},
@@ -166,6 +178,10 @@ Json session_to_json(const domain::Session& session, const std::optional<domain:
         {"updated_at", domain::format_timestamp_utc(session.updated_at)},
         {"last_error", session.last_error ? Json(*session.last_error) : Json(nullptr)},
     };
+
+    if (session.scheduler_alias.has_value()) {
+        body["scheduler_id"] = *session.scheduler_alias;
+    }
 
     if (stream_plan.has_value()) {
         body["streams"] = stream_plan_to_json(*stream_plan);
@@ -264,6 +280,21 @@ std::string get_optional_name(const Json& body) {
     return it->get<std::string>();
 }
 
+std::optional<std::string> get_optional_scheduler_id(const Json& body) {
+    const auto it = body.find("scheduler_id");
+    if (it == body.end() || it->is_null()) {
+        return std::nullopt;
+    }
+    if (!it->is_string()) {
+        throw app::ValidationError("scheduler_id must be a string");
+    }
+    auto scheduler_id = it->get<std::string>();
+    if (scheduler_id.empty()) {
+        return std::nullopt;
+    }
+    return scheduler_id;
+}
+
 std::string decode_percent_encoded(std::string_view value) {
     std::string decoded;
     decoded.reserve(value.size());
@@ -302,6 +333,8 @@ ErrorDetails current_error_details() {
         return {500, "runtime_error", error.what()};
     } catch (const app::TimeoutError& error) {
         return {504, "timeout", error.what()};
+    } catch (const catalog::SchedulerCatalogLoadError& error) {
+        return {500, "scheduler_catalog_error", error.what()};
     } catch (const catalog::CatalogLoadError& error) {
         return {500, "catalog_error", error.what()};
     } catch (const std::exception&) {
@@ -352,6 +385,7 @@ void register_routes(httplib::Server& server,
                      app::SessionService& session_service,
                      app::SessionStreamService&,
                      app::BlockCatalogService& block_catalog_service,
+                     app::SchedulerCatalogService& scheduler_catalog_service,
                      app::BlockSettingsService& block_settings_service) {
     server.Get("/healthz", [](const httplib::Request&, httplib::Response& response) {
         set_json_response(response, Json{{"ok", true}});
@@ -372,10 +406,27 @@ void register_routes(httplib::Server& server,
                    });
                });
 
+    server.Get("/schedulers", [&scheduler_catalog_service](const httplib::Request&, httplib::Response& response) {
+        execute(response, [&]() {
+            set_json_response(response, schedulers_to_json(scheduler_catalog_service.list()));
+        });
+    });
+
+    server.Get(R"(/schedulers/(.+))",
+               [&scheduler_catalog_service](const httplib::Request& request, httplib::Response& response) {
+                   execute(response, [&]() {
+                       set_json_response(response,
+                                         scheduler_to_json(scheduler_catalog_service.get(
+                                             decode_percent_encoded(request.matches[1].str()))));
+                   });
+               });
+
     server.Post("/sessions", [&session_service](const httplib::Request& request, httplib::Response& response) {
         execute(response, [&]() {
             const auto body = parse_json_body(request);
-            const auto session = session_service.create(get_optional_name(body), get_required_grc(body));
+            const auto session = session_service.create(get_optional_name(body),
+                                                        get_required_grc(body),
+                                                        get_optional_scheduler_id(body));
             set_json_response(response, session_to_json(session), 201);
         });
     });
@@ -636,12 +687,14 @@ struct gr4cp::api::HttpServer::Impl {
     Impl(app::SessionService& session_service_ref,
          app::SessionStreamService& session_stream_service,
          app::BlockCatalogService& block_catalog_service,
+         app::SchedulerCatalogService& scheduler_catalog_service,
          app::BlockSettingsService& block_settings_service)
         : session_service(session_service_ref) {
         register_routes(internal_server,
                         session_service_ref,
                         session_stream_service,
                         block_catalog_service,
+                        scheduler_catalog_service,
                         block_settings_service);
     }
 
@@ -949,10 +1002,12 @@ private:
 gr4cp::api::HttpServer::HttpServer(app::SessionService& session_service,
                                    app::SessionStreamService& session_stream_service,
                                    app::BlockCatalogService& block_catalog_service,
+                                   app::SchedulerCatalogService& scheduler_catalog_service,
                                    app::BlockSettingsService& block_settings_service)
     : impl_(std::make_unique<Impl>(session_service,
                                    session_stream_service,
                                    block_catalog_service,
+                                   scheduler_catalog_service,
                                    block_settings_service)) {}
 
 gr4cp::api::HttpServer::~HttpServer() = default;
