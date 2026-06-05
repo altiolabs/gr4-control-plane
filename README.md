@@ -1,21 +1,43 @@
 # gr4-control-plane
 
-Minimal C++23 REST control plane for GNU Radio 4 sessions. This repository was formerly `gr4-control-plane-mvp`.
+`gr4-control-plane` is a small C++23 REST service for creating and controlling GNU Radio 4 sessions.
 
-This codebase is intentionally narrow:
+It is designed as a focused control surface:
 
-- single-process appliance
-- session lifecycle plus a narrow live block-settings surface
-- GR4-backed read-only block catalog
-- one thin HTTP layer over application services
-- one thin CLI client over the REST API
-- no broader platform features
+- create, list, inspect, start, stop, restart, and delete sessions
+- update and read live block settings on running sessions
+- expose a read-only GNU Radio 4-backed block catalog
+- keep session state in memory
+- keep HTTP and CLI layers thin over application services
 
-The core application logic lives in the `domain`, `storage`, `runtime`, and `app` layers. The `api` layer is intentionally thin and only translates HTTP into service calls, serialization, and error mapping.
+The service is not a multi-tenant platform, graph editor, diagnostics system, plugin manager, or observability API. The core application boundary is `SessionService`; HTTP routes translate requests into service calls and serialize the result.
 
-The repository also includes `gr4cp-cli`, a thin client that talks to the REST API. It does not implement any control-plane logic locally. See [`docs/design.md`](docs/design.md) for the architecture notes.
+## Repository Layout
 
-## Build
+- `include/gr4cp/domain`, `src/domain`: session and catalog domain types
+- `include/gr4cp/storage`, `src/storage`: in-memory session repository
+- `include/gr4cp/runtime`, `src/runtime`: GNU Radio 4 runtime integration plus test stub runtime
+- `include/gr4cp/app`, `src/app`: application services
+- `include/gr4cp/api`, `src/api`: HTTP adapter
+- `include/gr4cp/cli`, `src/cli`: REST API client CLI
+- `test`: unit, HTTP, CLI, and smoke tests
+- `docs/design.md`: architecture notes
+
+## Requirements
+
+- CMake 3.25 or newer
+- C++23 compiler
+- GNU Radio 4 installation with CMake package files
+- Boost headers
+- nlohmann-json
+- cpp-httplib
+- GTest
+- Zlib
+- pkg-config
+
+The production block catalog is GNU Radio 4-backed only. With the default `GR4CP_ENABLE_GR4_CATALOG=ON`, configuration requires a working `gnuradio4` package. Server startup also validates GNU Radio 4 plugin loading and catalog reflection before accepting requests. If initialization fails, the server exits instead of serving placeholder catalog data.
+
+## Build And Test
 
 ```bash
 cmake -S . -B build
@@ -23,86 +45,75 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-The block catalog is GNU Radio 4-backed only. `GR4CP_ENABLE_GR4_CATALOG=ON` is the normal build mode, and configuration requires a working `gnuradio4` installation. Server startup validates plugin loading and reflection up front; if the GR4 catalog cannot be initialized, startup fails and the server does not run.
-
-To point CMake at a non-standard GNU Radio 4 install:
+If GNU Radio 4 is installed in a non-standard prefix:
 
 ```bash
 cmake -S . -B build -DGR4CP_GNURADIO4_PREFIX=/path/to/gr4/prefix
 ```
+
+`GR4CP_GNURADIO4_PREFIX` can also be provided as an environment variable.
+
+Useful build options:
+
+- `GR4CP_ENABLE_GR4_CATALOG=ON`: require the GNU Radio 4-backed catalog provider, enabled by default
+- `GR4CP_SUPPRESS_IMPORTED_WERROR=ON`: strip inherited `-Werror` from imported GNU Radio 4 targets when needed
+- `USE_CCACHE=ON`: use ccache when available, enabled by default
 
 Built executables:
 
 - `build/gr4cp_server`
 - `build/gr4cp-cli`
 
-## Docker Images
+## Run The Server
 
-The repository now uses three Docker images:
-
-- `ghcr.io/<owner>/gnuradio4-sdk:latest`
-  - GNU Radio 4 base SDK image
-  - built from the `gnuradio4-sdk` target in [`Dockerfile`](Dockerfile)
-  - includes GNU Radio 4 and `gr4-incubator`
-  - intended as the shared base for this repo and downstream OOT builds
-- `ghcr.io/<owner>/gr4-control-plane-sdk:latest`
-  - control-plane SDK image
-  - built from the `sdk` target in [`Dockerfile`](Dockerfile)
-  - includes the installed `gr4-control-plane` surface on top of `gnuradio4-sdk`
-- `ghcr.io/<owner>/gr4-control-plane-runtime:latest`
-  - lean runtime image
-  - built from the `runtime` target in [`Dockerfile`](Dockerfile)
-
-All three images are published as multi-arch manifests for `linux/amd64` and `linux/arm64`, so they can run on both standard Linux hosts and Apple Silicon.
-
-The SDK image can be used as a `FROM` base in downstream block repositories. For example:
-
-```dockerfile
-FROM ghcr.io/<owner>/gnuradio4-sdk:latest
-
-WORKDIR /workspace/my-oot
-COPY . .
-RUN cmake -S . -B build && cmake --build build -j"$(nproc)"
+```bash
+./build/gr4cp_server
 ```
 
-GitHub Actions behavior:
+The server listens on `0.0.0.0:8080` by default. Override the port with `GR4CP_PORT`:
 
-- `workflow_dispatch`
-  - can rebuild and publish `gnuradio4-sdk:latest`
-- pull requests
-  - build and test the control-plane SDK image only
-  - do not publish
-- pushes to `main`
-  - use `gnuradio4-sdk:latest`
-  - build and publish `gr4-control-plane-sdk:latest`
-  - build and publish `gr4-control-plane-runtime:latest`
+```bash
+GR4CP_PORT=8090 ./build/gr4cp_server
+```
+
+Temporary health check:
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
 
 ## HTTP API
 
-The public API consists of 11 product endpoints plus temporary `GET /healthz`:
+The public product API is limited to these endpoints:
 
-- Sessions:
-  - `POST /sessions`
-  - `GET /sessions`
-  - `GET /sessions/{id}`
-  - `DELETE /sessions/{id}`
-  - `POST /sessions/{id}/start`
-  - `POST /sessions/{id}/stop`
-  - `POST /sessions/{id}/restart`
-- Live block settings:
-  - `POST /sessions/{id}/blocks/{unique_name}/settings`
-  - `GET /sessions/{id}/blocks/{unique_name}/settings`
-- Block catalog:
-  - `GET /blocks`
-  - `GET /blocks/{id}`
+- `POST /sessions`
+- `GET /sessions`
+- `GET /sessions/{id}`
+- `DELETE /sessions/{id}`
+- `POST /sessions/{id}/start`
+- `POST /sessions/{id}/stop`
+- `POST /sessions/{id}/restart`
+- `POST /sessions/{id}/blocks/{unique_name}/settings`
+- `GET /sessions/{id}/blocks/{unique_name}/settings`
+- `GET /blocks`
+- `GET /blocks/{id}`
 
-Bootstrap-only endpoint:
+`GET /healthz` is a temporary bootstrap endpoint and is not part of the product API.
 
-- `GET /healthz`
+Errors are returned as JSON:
 
-`GET /healthz` is temporary infrastructure for bring-up and is not part of the product API.
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "request body must be valid JSON"
+  }
+}
+```
 
-### Create A Session
+## Session Lifecycle
+
+Create a session from inline GRC content:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/sessions \
@@ -110,61 +121,70 @@ curl -X POST http://127.0.0.1:8080/sessions \
   -d '{"name":"demo","grc":"<inline grc content>"}'
 ```
 
-If `name` is omitted, the server stores an empty string.
+`grc` is required and must be a non-empty string. `name` is optional and defaults to an empty string.
 
-### List Sessions
+List sessions:
 
 ```bash
 curl http://127.0.0.1:8080/sessions
 ```
 
-### Start A Session
+Inspect a session:
+
+```bash
+curl http://127.0.0.1:8080/sessions/<id>
+```
+
+Start, stop, or restart a session:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/sessions/<id>/start
-```
-
-### Stop A Session
-
-```bash
 curl -X POST http://127.0.0.1:8080/sessions/<id>/stop
-```
-
-### Restart A Session
-
-```bash
 curl -X POST http://127.0.0.1:8080/sessions/<id>/restart
 ```
 
-### Current Managed Stream Scope
-
-The current `streams[]`/managed-route slice is driven by authored stream-export metadata on blocks rather than block-family-specific planner rules.
-
-Authored stream metadata may be expressed as either:
-
-- preferred nested form under `parameters.stream`
-- compatibility flattened fields such as `transport` plus `payload_format`
-
-Current managed transport values are `http_snapshot`, `http_poll`, and `websocket`.
-
-Behavior notes:
-
-- `streams[]` is emitted only for running sessions
-- authored stream metadata is the persisted managed-stream intent the runtime uses
-- authored `endpoint` may still exist in stored graph content, but the managed runtime path ignores it whenever a managed stream descriptor is derived
-- runtime-owned bindings plus session-scoped browser-facing routes define the active-session stream path
-- blocks without valid stream-export metadata remain on the legacy no-`streams[]` path
-- a managed stream with an invalid/unsupported transport fails explicitly on start/restart instead of silently degrading to legacy fallback
-
-### Delete A Session
+Delete a session:
 
 ```bash
 curl -X DELETE http://127.0.0.1:8080/sessions/<id>
 ```
 
-### Update Running Block Settings
+Session responses include `id`, `name`, `state`, `created_at`, `updated_at`, and `last_error`. A running session may also include runtime-derived stream descriptors when the submitted graph contains supported managed stream metadata.
 
-`POST /sessions/{id}/blocks/{unique_name}/settings` applies a partial settings update to a running block addressed by its runtime `unique_name`.
+## Runtime Stream Descriptors
+
+When a running session contains supported authored stream-export metadata, session responses may include a `streams` array. This is runtime-derived session metadata, not a separate stream-management API.
+
+Supported authored transport values:
+
+- `http_snapshot`
+- `http_poll`
+- `websocket`
+
+Authored stream metadata is read from graph block parameters. The preferred shape is nested under `parameters.stream`; compatibility flattened fields such as `stream_id`, `transport`, and `payload_format` are also accepted.
+
+Each descriptor includes:
+
+- `id`
+- `block_instance_name`
+- `transport`
+- `payload_format`
+- `path`
+- `ready`
+
+Behavior notes:
+
+- `streams` appears only for running sessions.
+- stored graph content is not rewritten when runtime bindings are derived.
+- authored endpoint values may remain in graph content, but runtime-owned bindings define the active session descriptor when supported stream metadata is present.
+- invalid supported stream metadata fails start or restart explicitly.
+- sessions without supported stream metadata omit `streams`.
+
+## Live Block Settings
+
+Live block settings operate only on running sessions. Blocks are addressed by runtime `unique_name`.
+
+Apply a partial settings update:
 
 ```bash
 curl -X POST http://127.0.0.1:8080/sessions/<id>/blocks/src0/settings \
@@ -172,28 +192,34 @@ curl -X POST http://127.0.0.1:8080/sessions/<id>/blocks/src0/settings \
   -d '{"frequency":1250.0,"amplitude":0.5}'
 ```
 
-Use `?mode=immediate` to request the immediate GR4 property endpoint instead of the default staged path.
+By default, updates use the staged GR4 settings path. Use `mode=immediate` for the immediate GR4 property endpoint:
 
-This endpoint only operates on running sessions. It returns a conflict error for stopped or errored sessions and does not fabricate static values from stored GRC content.
+```bash
+curl -X POST 'http://127.0.0.1:8080/sessions/<id>/blocks/src0/settings?mode=immediate' \
+  -H 'Content-Type: application/json' \
+  -d '{"frequency":1250.0}'
+```
 
-Request bodies must be JSON objects. Supported JSON value shapes are `null`, boolean, integer, floating point, string, and nested objects. Arrays are rejected.
+Request bodies must be JSON objects. Supported values are `null`, boolean, integer, floating point, string, and nested object values. Arrays are rejected.
 
-Successful responses include:
+Successful updates return:
 
-- `session_id`
-- `block`
-- `applied_via` (`staged_settings` or `settings`)
-- `accepted`
+```json
+{
+  "session_id": "sess_0123456789abcdef",
+  "block": "src0",
+  "applied_via": "staged_settings",
+  "accepted": true
+}
+```
 
-### Read Running Block Settings
-
-`GET /sessions/{id}/blocks/{unique_name}/settings` fetches the current effective runtime settings for a running block.
+Read effective runtime settings:
 
 ```bash
 curl http://127.0.0.1:8080/sessions/<id>/blocks/src0/settings
 ```
 
-The response is wrapped as:
+Response:
 
 ```json
 {
@@ -204,35 +230,34 @@ The response is wrapped as:
 }
 ```
 
+Stopped or errored sessions return a conflict error for this surface. The service does not fabricate settings from stored GRC content.
+
 ## Block Catalog
 
-The block catalog is a read-only metadata surface intended for future `gr4-studio` integration. GR4 plugin loading, registry enumeration, and block reflection are the source of truth for this metadata. The production server does not fall back to static catalog data.
-
-- `GET /blocks`
-- `GET /blocks/{id}`
-
-This catalog is not runtime graph inspection and is not coupled to running sessions.
-
-Examples:
+The block catalog is read-only metadata for client tooling such as future `gr4-studio` integration. It is populated from GNU Radio 4 plugin loading, registry enumeration, and reflection.
 
 ```bash
 curl http://127.0.0.1:8080/blocks
 curl http://127.0.0.1:8080/blocks/blocks.math.add_ff
 ```
 
+Catalog responses describe block IDs, names, categories, summaries, ports, and parameters. The catalog is independent of running sessions and is not runtime graph inspection.
+
 ## CLI
 
-The CLI is a small wrapper over the 7 session lifecycle endpoints. It talks to a running server and defaults to `http://127.0.0.1:8080`.
+`gr4cp-cli` is a thin client for the session lifecycle API. It talks to a running server and defaults to `http://127.0.0.1:8080`.
 
 Supported commands:
 
-- `gr4cp-cli sessions create --file path/to/graph.grc [--name demo] [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions list [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions get <id> [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions start <id> [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions stop <id> [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions restart <id> [--url http://127.0.0.1:8080]`
-- `gr4cp-cli sessions delete <id> [--url http://127.0.0.1:8080]`
+```text
+gr4cp-cli sessions create --file <path> [--name <name>] [--url <url>]
+gr4cp-cli sessions list [--url <url>]
+gr4cp-cli sessions get <id> [--url <url>]
+gr4cp-cli sessions start <id> [--url <url>]
+gr4cp-cli sessions stop <id> [--url <url>]
+gr4cp-cli sessions restart <id> [--url <url>]
+gr4cp-cli sessions delete <id> [--url <url>]
+```
 
 Examples:
 
@@ -243,6 +268,18 @@ Examples:
 ./build/gr4cp-cli sessions delete sess_0123456789abcdef
 ```
 
+## Architecture Notes
+
+The mandatory layers are explicit:
+
+- `domain`: core data types and validation helpers
+- `storage`: repository interface and in-memory implementation
+- `runtime`: session runtime manager boundary and GNU Radio 4 implementation
+- `app`: service layer and lifecycle semantics
+- `api`: HTTP adapter
+
+The HTTP layer parses, delegates, serializes, and maps errors. The CLI is only a REST API client and does not duplicate lifecycle logic. The block catalog remains separate from session lifecycle and uses a provider/service boundary.
+
 ## License
 
-This project is licensed under the MIT License. See [`LICENSE`](/home/josh/github_altiolabs/gr4-dev/src/gr4-control-plane/LICENSE) for the full text.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for the full text.

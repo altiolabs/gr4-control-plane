@@ -1,123 +1,46 @@
 # Design
 
-## Product Goal
+## Product Shape
 
-Build a minimal C++23 REST control plane that can create, inspect, and drive GNU Radio 4 sessions, expose a narrow live block-settings surface, and serve a read-only GNU Radio 4 block catalog. The product goal is a small session runner appliance, not a general-purpose control platform.
+`gr4-control-plane` is a focused C++23 REST service for creating and controlling GNU Radio 4 sessions. It is intended to be built on as the session-control boundary.
 
-## Minimal Philosophy
+The product surface is deliberately small:
 
-- Prefer simplicity over extensibility.
-- Keep one process and minimal dependencies.
-- Push business logic into application services rather than route handlers.
-- Treat new scope as suspect unless it directly serves session lifecycle control.
-- Preserve clean boundaries so future work can be added without contaminating the MVP.
+- session lifecycle control
+- live block settings for running sessions
+- read-only GNU Radio 4-backed block catalog
+- thin HTTP and CLI adapters over application services
+
+The service is not a general platform layer. It does not provide multi-tenant orchestration, graph editing, diagnostics, observability, history, audit, or public plugin management APIs.
 
 ## Architecture Layers
 
-- `domain`: pure types such as `Session` and `SessionState`
-- `storage`: repository boundary, in-memory only for the MVP
-- `runtime`: runtime execution boundary, stubbed for now but invoked by the service
-- `app`: `SessionService` for session lifecycle plus `BlockSettingsService` for live block settings control
-- `api`: thin HTTP transport layer that delegates to `SessionService`, `BlockSettingsService`, and `BlockCatalogService`
-- `catalog`: provider-backed read-only block metadata for future studio integration
+The mandatory layers are:
 
-## Thin HTTP Layer
+- `domain`: core types and pure validation helpers
+- `storage`: repository interfaces and persistence implementations
+- `runtime`: GNU Radio 4 execution boundary
+- `app`: application services and lifecycle semantics
+- `api`: HTTP transport adapter
 
-The HTTP layer is intentionally small:
+Supporting namespaces:
 
-- parse request JSON and path parameters
-- call `SessionService`
-- call `BlockCatalogService`
-- call `BlockSettingsService`
-- serialize session and error responses
-- map application exceptions to HTTP status codes
+- `catalog`: provider-backed read-only GNU Radio 4 metadata
+- `cli`: command-line REST API client
 
-It must not contain lifecycle rules, runtime orchestration, catalog curation rules, settings conversion rules, or alternative state machines. `SessionService` remains the single source of truth for create, start, stop, restart, and remove semantics, `BlockCatalogService` owns read-only catalog lookup behavior, and `BlockSettingsService` owns live runtime settings behavior.
+New work should extend these layers instead of adding side channels or broad platform abstractions.
 
-## CLI Client
+## Application Boundary
 
-`gr4cp-cli` is a thin client for the REST API, not a second control plane. It reads local GRC files for `sessions create`, sends inline content to the existing HTTP server, and renders server responses or errors for an operator. It must not reimplement lifecycle rules, runtime behavior, or any business logic that belongs in `SessionService`.
+`SessionService` is the core application boundary. It owns session lifecycle semantics and coordinates repository state with runtime operations.
 
-## Block Catalog
+Lifecycle states:
 
-The block catalog is intentionally separate from the session lifecycle. Its purpose is to expose stable, read-only metadata that a future `gr4-studio` UI can browse without depending on running sessions or runtime inspection.
+- `stopped`
+- `running`
+- `error`
 
-The catalog slice uses a provider/service seam:
-
-- `domain`: block descriptor, port descriptor, and parameter descriptor types
-- `catalog`: `BlockCatalogProvider` and a GR4-backed `Gr4BlockCatalogProvider`
-- `app`: `BlockCatalogService` for one-time snapshot caching plus deterministic list/get behavior
-
-The preferred provider is tightly coupled to GNU Radio 4 itself:
-
-- load plugins through GR4's plugin loader
-- enumerate block types from the GR4 registry
-- instantiate block models through GR4
-- reflect ports and settings directly from `BlockModel`
-- translate that metadata into this repo's stable `BlockDescriptor` shape
-
-This repo intentionally does not import the old multi-layer plugin services, diagnostics surfaces, subprocess reflection paths, or graph validation architecture. GR4 is the source of truth, and this code only performs a thin translation into the API shape.
-
-`BlockCatalogService` caches the provider snapshot in memory on first use. There is no refresh endpoint or rescan loop in this MVP; restart the process to reload the catalog. Server startup forces the initial load so a broken GR4 plugin or reflection environment fails fast instead of serving placeholder metadata.
-
-Current mapping compromises:
-
-- block summaries default to an empty string when GR4's type-erased reflection path does not expose a stable description field
-- parameter `required` flags default to `false` because GR4's runtime reflection path does not expose that distinction cleanly here
-- a small set of GR4 framework/base-block settings is filtered out so the API exposes user-facing block parameters rather than transport/runtime internals
-
-The catalog must remain read-only metadata. It must not depend on runtime graph inspection, session state, or running graphs.
-
-## Live Block Settings
-
-Studio needs one narrow runtime control surface for widgets such as sliders, toggles, and numeric inputs. The control plane exposes that surface as settings-oriented HTTP endpoints instead of a generic runtime message bus:
-
-- `POST /sessions/{id}/blocks/{unique_name}/settings`
-- `GET /sessions/{id}/blocks/{unique_name}/settings`
-
-These endpoints are session-scoped and runtime-only:
-
-- they address a block by its running GR4 `unique_name`
-- they require the session to be in `Running`
-- they return conflict errors for non-running sessions
-- they do not inspect stored GRC data to fabricate values
-
-`POST /settings` accepts a plain JSON object and translates it into a GNU Radio 4 property message:
-
-- default mode: `Set + StagedSettings`
-- optional immediate mode: `Set + Settings`
-
-The HTTP response records the applied mode as `staged_settings` or `settings`, and the request body must be a JSON object. Supported JSON values are `null`, boolean, integer, floating point, string, and nested objects; arrays are rejected.
-
-`GET /settings` translates into:
-
-- `Get + Settings`
-
-The HTTP response wraps the current runtime settings under a top-level `settings` key.
-
-The runtime path stays narrow and production-aligned:
-
-- HTTP parses and serializes only
-- `BlockSettingsService` validates session state and payload shape
-- `RuntimeManager` owns GR4 interaction
-- `Gr4RuntimeManager` uses the scheduler's built-in message routing to send the request to the target block and wait for the reply
-
-Payload conversion is intentionally strict:
-
-- supported request values: `null`, boolean, integer, floating point, string, nested objects
-- arrays are rejected for now
-- nested JSON objects map to nested `property_map`
-- unsupported runtime reply value shapes are reported as errors
-
-## Session Lifecycle Concept
-
-The control plane will manage a small lifecycle for a session:
-
-- stopped
-- running
-- error
-
-Each `Session` stores:
+Each session stores:
 
 - `id`
 - `name`
@@ -126,53 +49,22 @@ Each `Session` stores:
 - optional `last_error`
 - `created_at`
 - `updated_at`
+- optional scheduler alias used by runtime preparation
 
-Lifecycle semantics are owned by `SessionService`:
+Lifecycle rules:
 
-- `create` validates non-empty GRC content and stores a new session in `Stopped`
-- `start` prepares and starts the runtime, then marks the session `Running`
-- `stop` is a no-op success when the session is already `Stopped`
-- `restart` stops a running session first, then always destroys, prepares, and starts again
-- `remove` stops a running session first, then destroys runtime state and deletes the session
+- `create` validates non-empty GRC content and stores a new stopped session.
+- `start` prepares and starts runtime execution, then marks the session running.
+- `stop` succeeds when already stopped and otherwise stops runtime execution before persisting stopped state.
+- `restart` performs stop-complete-then-start behavior.
+- `remove` stops a running session before destroying runtime state and deleting the session.
+- runtime failures are recorded on the session as `error` with `last_error`, then surfaced as application errors.
 
-If runtime operations fail during start, stop, restart, or remove, the service records the session as `Error`, stores `last_error`, updates `updated_at`, persists that state, and then throws an application-level runtime error.
+Business rules belong in `SessionService` or the specific application service responsible for the feature. They do not belong in route handlers or the CLI.
 
-## Current Managed Stream Scope
+## HTTP API
 
-The current managed-stream integration is intentionally narrow and session-runtime-owned:
-
-- `GET /sessions` and `GET /sessions/{id}` may include optional `streams[]` only for running sessions
-- managed stream planning uses authored stream-export metadata on blocks, not block-family-specific planner rules
-- supported transport values are `http_snapshot`, `http_poll`, and `websocket`
-- authored stream-export metadata selects the managed runtime path and authored `endpoint` is ignored by control-plane runtime preparation
-- running-session `streams[]` plus the session-scoped browser routes are the active runtime contract
-- blocks without valid stream-export metadata remain on the legacy no-`streams[]` path
-- if authored stream-export metadata uses an invalid/unsupported managed transport, start/restart fails explicitly instead of silently falling back
-
-## Runtime Seam
-
-The runtime layer exists to isolate session lifecycle logic from GNU Radio execution details. The current `StubRuntimeManager` succeeds by default and only provides the control-plane seam needed by `SessionService`:
-
-- `prepare`
-- `start`
-- `stop`
-- `destroy`
-- `set_block_settings`
-- `get_block_settings`
-
-This keeps runtime-specific concerns out of storage, domain, and HTTP while preserving a clean insertion point for later GR4 integration.
-
-## In-Memory Repository Choice
-
-The MVP uses a thread-safe in-memory repository backed by `std::unordered_map<std::string, Session>` and a single `std::mutex`. This is sufficient for the current appliance scope:
-
-- no persistence
-- no distributed coordination
-- no extra repository abstractions beyond CRUD needed by `SessionService`
-
-## API Contract
-
-The only intended public API for this MVP is these 11 product endpoints:
+The public product API is limited to these endpoints:
 
 - `POST /sessions`
 - `GET /sessions`
@@ -186,14 +78,158 @@ The only intended public API for this MVP is these 11 product endpoints:
 - `GET /blocks`
 - `GET /blocks/{id}`
 
-No other product endpoints are allowed. A temporary bootstrap endpoint, `GET /healthz`, is allowed during bring-up.
+`GET /healthz` is temporary bootstrap infrastructure and is not part of the product API.
 
-## Out Of Scope
+No other product endpoints should be added without an explicit scope decision.
 
-- Platform capabilities beyond a local session runner
-- Graph modeling or graph editing abstractions
-- Diagnostics, history, audit trails, or observability APIs
-- Server-sent events, websockets, or other push channels
-- Runtime-driven catalog generation or graph inspection
-- Generic graph editing or parameter patching APIs beyond the narrow live block settings surface
-- Compatibility layers for older designs
+The HTTP layer stays thin:
+
+- parse JSON bodies and path parameters
+- call application services
+- serialize successful responses
+- map application errors to HTTP responses
+
+It must not contain lifecycle state machines, runtime orchestration, catalog curation, settings conversion rules, or compatibility policy.
+
+## CLI
+
+`gr4cp-cli` is a client of the REST API. It reads local GRC files for `sessions create`, sends requests to a running server, and prints server responses.
+
+It must not duplicate `SessionService` lifecycle behavior, inspect runtime state locally, or implement a second control plane.
+
+## Storage
+
+The current repository implementation is thread-safe and in memory. This matches the current appliance shape:
+
+- no persistence
+- no distributed coordination
+- no cross-process state sharing
+
+Future persistence should be added behind the existing repository boundary. It should not change HTTP route behavior or move lifecycle rules out of `SessionService`.
+
+## Runtime
+
+The runtime layer isolates application lifecycle semantics from GNU Radio 4 execution details.
+
+`RuntimeManager` owns the execution boundary:
+
+- prepare runtime resources
+- start execution
+- stop execution
+- destroy runtime resources
+- apply live block settings
+- read live block settings
+
+`Gr4RuntimeManager` is the production runtime implementation. It loads submitted GRC content through GNU Radio 4, prepares scheduler execution, and uses GNU Radio 4 runtime messaging for live settings. The stub runtime exists for focused tests and must not become a second product behavior path.
+
+Runtime-specific details must stay out of `domain`, `storage`, and `api`.
+
+## Block Catalog
+
+The block catalog is a read-only metadata surface for client tooling. It is independent of session lifecycle and running graphs.
+
+The catalog path uses a provider/service boundary:
+
+- `domain`: block, port, and parameter descriptor types
+- `catalog`: `BlockCatalogProvider` plus the GNU Radio 4-backed provider
+- `app`: `BlockCatalogService` for snapshot caching and deterministic list/get behavior
+
+The production catalog source is GNU Radio 4:
+
+- load plugins through GNU Radio 4 plugin loading
+- enumerate registered block types
+- instantiate block models for reflection
+- translate reflected metadata into stable `BlockDescriptor` values
+
+If GNU Radio 4 plugin loading, registry enumeration, or reflection cannot initialize, server startup must fail. The production server must not fall back to static placeholder catalog data.
+
+The catalog must remain read-only. It must not depend on running sessions, runtime graph inspection, or custom plugin platform abstractions.
+
+## Live Block Settings
+
+Live block settings are the narrow runtime control surface for active graphs:
+
+- `POST /sessions/{id}/blocks/{unique_name}/settings`
+- `GET /sessions/{id}/blocks/{unique_name}/settings`
+
+Rules:
+
+- settings calls are session-scoped
+- the target block is addressed by runtime `unique_name`
+- the session must be running
+- stopped or errored sessions return conflict errors
+- stored GRC content is not inspected to fabricate values
+
+`POST /settings` accepts a JSON object and translates it into GNU Radio 4 runtime settings messages:
+
+- default mode: staged settings
+- `mode=immediate`: immediate settings
+
+Supported JSON value shapes are:
+
+- `null`
+- boolean
+- integer
+- floating point
+- string
+- nested object
+
+Arrays are rejected. Unsupported runtime reply shapes are surfaced as errors.
+
+## Stream Metadata
+
+Session responses may include runtime-derived stream descriptors for running sessions when submitted graph content contains supported stream-export metadata. This is response data associated with session lifecycle, not a separate public stream-management API.
+
+Supported authored transport values:
+
+- `http_snapshot`
+- `http_poll`
+- `websocket`
+
+Authored stream metadata may be expressed in either of these forms:
+
+- preferred nested metadata under `parameters.stream`
+- compatibility flattened fields such as `stream_id`, `transport`, and `payload_format`
+
+Runtime stream descriptors are serialized in session responses under `streams` only when the session is running and the runtime has active stream bindings. Each descriptor contains:
+
+- `id`
+- `block_instance_name`
+- `transport`
+- `payload_format`
+- `path`
+- `ready`
+
+Stream handling remains runtime-owned:
+
+- authored graph content stores stream intent
+- runtime preparation derives active bindings
+- active descriptors are scoped to the running session generation
+- stored graph content is not rewritten during runtime preparation
+- authored endpoint values may remain in graph content, but runtime-owned bindings define the active descriptor for supported managed stream metadata
+- invalid supported stream metadata fails start or restart explicitly
+- absence of supported stream metadata leaves the session on the no-stream-descriptor path
+
+Do not introduce public stream, websocket, SSE, diagnostics, or history surfaces as part of this feature area.
+
+## Error Handling
+
+Application services raise typed errors for validation, not-found, invalid-state, runtime, timeout, catalog, and scheduler-catalog failures. The HTTP layer maps those errors into stable JSON error responses.
+
+Route handlers should not inspect exception internals beyond this mapping. Application services should provide messages that are useful to operators while preserving the narrow API contract.
+
+## Scope Boundaries
+
+Out of scope:
+
+- graph abstractions or graph editing APIs
+- generic parameter patching beyond live block settings
+- multi-tenant control planes
+- orchestration layers
+- observability, diagnostics, history, audit, metrics, or admin APIs
+- public plugin management APIs
+- SSE, websocket, or event-stream product surfaces
+- runtime graph inspection as a catalog source
+- compatibility layers for older platform designs
+
+Prefer deletion over expansion. Add abstractions only when they remove real complexity inside the existing layer boundaries.
