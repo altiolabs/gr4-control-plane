@@ -1,5 +1,12 @@
 # gr4-control-plane
 
+> [!IMPORTANT]
+> This repository has moved.
+>
+> Active development has moved to: **https://github.com/gnuradio/gnuradio4-control-plane**
+>
+> This repository is retained for historical reference and will not receive future updates. Please open new issues, pull requests, and discussions in the new repository.
+
 `gr4-control-plane` is a small C++23 REST service for creating and controlling GNU Radio 4 sessions.
 
 It is designed as a focused control surface:
